@@ -42,6 +42,12 @@ async def current_user(request: Request, db: AsyncSession = Depends(get_db)) -> 
     return user
 
 
+def same_origin(request: Request) -> None:
+    """Rejects state-changing requests that don't come from the dashboard itself."""
+    if request.headers.get("origin") != FRONTEND_URL:
+        raise HTTPException(403, "Invalid request origin.")
+
+
 @router.get("/config")
 async def auth_config():
     return {"google_enabled": configured()}
@@ -95,9 +101,7 @@ async def me(user: User = Depends(current_user)):
     return {"id": str(user.id), "name": user.name, "email": user.email, "picture": user.picture}
 
 
-@router.post("/logout")
+@router.post("/logout", dependencies=[Depends(same_origin)])
 async def logout(request: Request):
-    if request.headers.get("origin") != FRONTEND_URL:
-        raise HTTPException(403, "Invalid request origin.")
     request.session.clear()
     return {"status": "signed_out"}

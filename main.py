@@ -7,7 +7,7 @@ from typing import List, Optional
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Header, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +19,9 @@ from database import get_db, init_db
 from models import Transaction, User
 from parser import ParsedTransaction, compute_message_hash, parse_sms
 from auth import FRONTEND_URL, current_user, router as auth_router
+from balance import BalanceSummary, owner_balance, router as balance_router
+from limits import check_spend_limits, router as limits_router
+from notifications import router as notifications_router
 from dashboard import ownership, router as dashboard_router
 
 load_dotenv()
@@ -47,7 +50,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_URL],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "Authorization", "X-Webhook-Secret"],
 )
 app.add_middleware(
@@ -60,6 +63,9 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.include_router(dashboard_router)
+app.include_router(balance_router)
+app.include_router(limits_router)
+app.include_router(notifications_router)
 
 
 @app.middleware("http")
@@ -130,6 +136,18 @@ class WebhookResponse(BaseModel):
     status: str
     message: str
     transaction: Optional[TransactionResponse] = None
+    balance: Optional[BalanceSummary] = Field(
+        default=None, description="Balance left after this SMS, if the owner has set one in Settings"
+    )
+
+
+async def balance_after(db: AsyncSession) -> Optional[BalanceSummary]:
+    """The balance is informational; it must never stop an SMS from being recorded."""
+    try:
+        return await owner_balance(db)
+    except Exception:
+        logger.exception("Could not compute the running balance")
+        return None
 
 
 @app.get("/", tags=["Health"])
@@ -150,14 +168,18 @@ async def root():
 )
 async def ingest_sms_webhook(
     payload: WebhookPayload,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """Webhook endpoint triggered by iOS Shortcuts automation when a bank SMS arrives.
     
     1. Validates authentication token.
     2. Hashes message to guarantee idempotency and prevent duplicate entries.
-    3. Parses SMS with fast Regex rules, falling back to Gemini AI Agent if uncertain.
-    4. Persists the transaction in TiDB Cloud.
+    3. Parses SMS with fast Regex rules, falling back to Gemini AI Agent if uncertain
+       (full parse when regex fails, category only when regex cannot categorize).
+    4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible).
+    5. Returns the updated running balance when one is set in Settings.
+    6. After responding, emails an alert if a weekly/monthly spend limit was reached.
     """
     raw_text = (payload.message or "").strip()
 
@@ -180,10 +202,11 @@ async def ingest_sms_webhook(
             status="duplicate",
             message="Transaction already processed and recorded.",
             transaction=TransactionResponse.model_validate(existing_txn),
+            balance=await balance_after(db),
         )
 
     # 2. Parse SMS (Regex first -> Gemini AI fallback)
-    parsed: ParsedTransaction = await parse_sms(raw_text)
+    parsed: ParsedTransaction = await parse_sms(raw_text, payload.sender)
     if parsed.parsed_by == "ignored":
         return WebhookResponse(status="ignored", message="Message is not a completed transaction.")
 
@@ -207,6 +230,9 @@ async def ingest_sms_webhook(
         is_parsed=parsed.is_parsed,
         parsed_by=parsed.parsed_by,
         transaction_time=tx_time,
+        # Stamped after parsing: the DB's now() is the transaction start, which can be
+        # ~30s earlier when Gemini is involved and would let a polling cursor skip the row.
+        created_at=datetime.now(timezone.utc),
     )
 
     db.add(new_txn)
@@ -221,13 +247,17 @@ async def ingest_sms_webhook(
         return WebhookResponse(
             status="duplicate", message="Transaction already processed and recorded.",
             transaction=TransactionResponse.model_validate(existing_txn),
+            balance=await balance_after(db),
         )
     await db.refresh(new_txn)
+    # Runs after the response is sent, so the iPhone Shortcut never waits on Gmail.
+    background_tasks.add_task(check_spend_limits, new_txn.id)
 
     return WebhookResponse(
         status="success",
         message=f"Transaction logged successfully via {parsed.parsed_by}",
         transaction=TransactionResponse.model_validate(new_txn),
+        balance=await balance_after(db),
     )
 
 
@@ -240,17 +270,17 @@ async def ingest_sms_webhook(
 async def list_transactions(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    created_after: Optional[AwareDatetime] = Query(
+        None, description="Only rows recorded at or after this time (inclusive), for cheap polling"
+    ),
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Returns transactions ordered by transaction time descending."""
-    query = (
-        select(Transaction)
-        .where(ownership(user))
-        .order_by(desc(Transaction.transaction_time))
-        .offset(offset)
-        .limit(limit)
-    )
+    query = select(Transaction).where(ownership(user))
+    if created_after is not None:
+        query = query.where(Transaction.created_at >= created_after.astimezone(timezone.utc))
+    query = query.order_by(desc(Transaction.transaction_time)).offset(offset).limit(limit)
     result = await db.execute(query)
     transactions = result.scalars().all()
     return [TransactionResponse.model_validate(t) for t in transactions]

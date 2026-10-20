@@ -5,10 +5,14 @@ os.environ["WEBHOOK_SECRET"] = "test-webhook-secret"
 os.environ["SESSION_SECRET"] = "test-session-secret-that-is-at-least-thirty-two-characters"
 os.environ["DASHBOARD_OWNER_EMAIL"] = "owner@example.com"
 os.environ["FRONTEND_URL"] = "http://localhost:3000"
-os.environ.pop("GEMINI_API_KEY", None)
+# Empty rather than removed: parser.load_dotenv() would otherwise reload the real key from .env.
+os.environ["GEMINI_API_KEY"] = ""
+for key in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "ALERT_EMAIL_TO"):
+    os.environ[key] = ""  # never send real mail from tests
 
+import asyncio
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
@@ -52,6 +56,7 @@ class ParserTests(unittest.IsolatedAsyncioTestCase):
         with patch("parser.parse_sms_with_gemini", new_callable=AsyncMock) as ai:
             parsed = await parse_sms("INR 1234 debited from your account XX1234")
             self.assertEqual(parsed.amount, Decimal(1234))
+            self.assertEqual(parsed.category, "Uncategorized")
             ai.assert_not_called()
 
 
@@ -110,6 +115,34 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["total"], 1)
         self.assertEqual(data["transactions"][0]["merchant"], "Merchant 1")
         self.assertEqual(float(data["expense"]), 250)
+
+    async def test_transactions_created_after_returns_only_new_rows(self):
+        base = datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc)
+        async with AsyncSessionLocal() as db:
+            for i, minutes in enumerate([0, 5, 10]):
+                db.add(Transaction(type="DEBIT", amount=100 + i, currency="INR", raw_message="fixture", message_hash=f"poll-{i}",
+                                   transaction_time=base, created_at=base + timedelta(minutes=minutes)))
+            await db.commit()
+        app.dependency_overrides[current_user] = lambda: self.owner
+        since = (base + timedelta(minutes=5)).isoformat()
+        response = await self.client.get("/api/v1/transactions", params={"created_after": since})
+        self.assertEqual(response.status_code, 200, response.text)
+        # Inclusive, so a row sharing the newest timestamp is never missed (the client de-duplicates).
+        self.assertEqual(sorted(t["amount"] for t in response.json()), [101, 102])
+        later = await self.client.get("/api/v1/transactions", params={"created_after": (base + timedelta(hours=1)).isoformat()})
+        self.assertEqual(later.json(), [])
+        naive = await self.client.get("/api/v1/transactions", params={"created_after": "2026-10-21T10:00:00"})
+        self.assertEqual(naive.status_code, 422)
+
+    async def test_webhook_stamps_created_at_after_parsing(self):
+        async def slow_parse(*args, **kwargs):
+            await asyncio.sleep(0.3)  # stands in for a slow Gemini call
+            return ParsedTransaction(type="DEBIT", amount=Decimal("10"), parsed_by="ai_agent")
+        with patch("main.parse_sms", side_effect=slow_parse):
+            before_parse = datetime.now(timezone.utc)
+            response = await self.client.post("/api/v1/webhook/sms", json={"message": "odd format 10"}, headers={"X-Webhook-Secret": "test-webhook-secret"})
+        created = datetime.fromisoformat(response.json()["transaction"]["created_at"]).replace(tzinfo=timezone.utc)
+        self.assertGreaterEqual(created, before_parse + timedelta(seconds=0.3))
 
     async def test_invalid_date_range(self):
         app.dependency_overrides[current_user] = lambda: self.owner
