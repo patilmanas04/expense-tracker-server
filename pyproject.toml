@@ -1,0 +1,26 @@
+[project]
+name = "expense-tracker-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "authlib>=1.6.5,<2",
+    "itsdangerous>=2.2,<3",
+    "tzdata>=2025.2",
+    "aiomysql>=0.3.2",
+    "asyncpg>=0.32.0",
+    "cryptography>=50.0.2",
+    "fastapi>=0.149.0",
+    "httpx>=0.28.1",
+    "langchain>=1.4.6",
+    "langchain-google-genai>=4.4.2",
+    "langgraph>=1.2.16",
+    "pydantic>=2.14.1",
+    "python-dotenv>=1.2.4",
+    "sqlalchemy[asyncio]>=2.1.5",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = ["aiosqlite>=0.21"]
