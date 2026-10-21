@@ -72,6 +72,7 @@ Set your current bank balance in the dashboard's Settings. From that moment, eve
 
 - Credit-card alerts (`BLOCK CC`, `Avl Limit`, `Cardmember`, "credit card" without a bank account) are **not** deducted. A card spend leaves your account when you pay the card bill, and that payment arrives as its own bank debit SMS. Card bills paid from an account (`… debited from A/c … towards … Credit Card`) do count.
 - Unparsed SMS (`is_parsed=false`) and other currencies are not counted.
+- Transactions added by hand as **Cash** are not counted either (they never pass through the bank). Ones added as **Bank account** count like an SMS.
 - The value lives in the `balance_settings` table, which `create_all` adds automatically on the next server start.
 
 ```http
@@ -81,6 +82,19 @@ DELETE /api/v1/balance
 ```
 
 All three require the dashboard session. `PUT`/`DELETE` also require the dashboard `Origin`. When a balance is set, `success` and `duplicate` webhook responses include `balance` (`current`, `spent`, `received`, `excluded_card`, …). In Shortcuts you can add **Get Dictionary Value** `balance` → `current` and **Show Notification** "Balance left: …" after each SMS.
+
+## Transactions added by hand
+
+The dashboard's Activity page has **Add** for cash and anything that never sent an SMS (UPI Lite, a missed alert).
+
+```http
+POST   /api/v1/transactions        {"type": "DEBIT", "amount": "249.50", "merchant": "Chai Point",
+                                    "transaction_time": "2026-10-22T19:30:00+05:30",
+                                    "category": null, "paid_with": "cash"}
+DELETE /api/v1/transactions/{id}   -> 204; only for entries added by hand (403 for bank SMS)
+```
+
+Both need the dashboard session and `Origin`. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
 
 ## Spend limits, notifications and (optional) email alerts
 

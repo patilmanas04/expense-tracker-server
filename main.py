@@ -2,14 +2,15 @@ import os
 import secrets
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import List, Literal, Optional
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import desc, select
@@ -17,9 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, init_db
 from models import Transaction, User
-from parser import ParsedTransaction, compute_message_hash, parse_sms
-from auth import FRONTEND_URL, current_user, router as auth_router
-from balance import BalanceSummary, owner_balance, router as balance_router
+from parser import CATEGORIES, ParsedTransaction, compute_message_hash, detect_category, parse_sms
+from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
+from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
 from limits import check_spend_limits, router as limits_router
 from notifications import router as notifications_router
 from dashboard import ownership, router as dashboard_router
@@ -284,3 +285,105 @@ async def list_transactions(
     result = await db.execute(query)
     transactions = result.scalars().all()
     return [TransactionResponse.model_validate(t) for t in transactions]
+
+
+# ---------- Transactions added by hand (Activity → Add) ----------
+
+MANUAL = "manual"  # parsed_by for transactions added by hand
+MAX_TRANSACTION_AMOUNT = Decimal("9999999999.99")  # Numeric(12, 2)
+
+
+class ManualTransactionInput(BaseModel):
+    type: Literal["DEBIT", "CREDIT"]
+    amount: Decimal = Field(gt=0, le=MAX_TRANSACTION_AMOUNT, max_digits=12, decimal_places=2)
+    merchant: str = Field(max_length=100, description="Who it was paid to or received from")
+    category: Optional[str] = Field(default=None, description="One of the app's categories; omit to pick one from the name")
+    transaction_time: AwareDatetime
+    paid_with: Literal["bank", "cash"] = Field(default="bank", description="Cash never changes the bank balance")
+
+    @field_validator("merchant")
+    @classmethod
+    def _merchant(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("Enter who it was paid to or received from.")
+        return value
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        match = next((c for c in CATEGORIES if c.casefold() == value.strip().casefold()), None)
+        if match is None:
+            raise ValueError("Unknown category.")
+        return match
+
+    @field_validator("transaction_time")
+    @classmethod
+    def _not_in_future(cls, value: datetime) -> datetime:
+        # A few minutes of slack for a phone clock that runs fast.
+        if value > datetime.now(timezone.utc) + timedelta(minutes=5):
+            raise ValueError("The date and time can't be in the future.")
+        return value.astimezone(timezone.utc)
+
+
+@app.post(
+    "/api/v1/transactions",
+    response_model=TransactionResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(same_origin)],
+    tags=["Transactions"],
+    summary="Add a transaction by hand",
+)
+async def add_transaction(
+    body: ManualTransactionInput,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """For cash and anything without an SMS. Counts in totals and spend limits like an SMS;
+    cash entries don't change the bank balance."""
+    now = datetime.now(timezone.utc)
+    txn = Transaction(
+        user_id=user.id,
+        type=body.type,
+        amount=body.amount,
+        currency="INR",
+        merchant=body.merchant,
+        category=body.category or detect_category(body.merchant, tx_type=body.type),
+        account_ref=CASH_ACCOUNT if body.paid_with == "cash" else None,
+        raw_message="Added by hand in Folio",
+        is_parsed=True,
+        parsed_by=MANUAL,
+        transaction_time=body.transaction_time,
+        created_at=now,
+    )
+    db.add(txn)
+    await db.commit()
+    await db.refresh(txn)
+    background_tasks.add_task(check_spend_limits, txn.id)
+    return TransactionResponse.model_validate(txn)
+
+
+@app.delete(
+    "/api/v1/transactions/{transaction_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(same_origin)],
+    tags=["Transactions"],
+    summary="Delete a transaction you added by hand",
+)
+async def delete_transaction(
+    transaction_id: uuid.UUID,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Only hand-added entries can be deleted; bank SMS are the record of what happened."""
+    txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
+    if txn is None or (txn.parsed_by == MANUAL and txn.user_id != user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
+    if txn.parsed_by != MANUAL:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only transactions you added by hand can be deleted.")
+    await db.delete(txn)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

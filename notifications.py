@@ -39,12 +39,6 @@ async def create_once(db: AsyncSession, user_id: uuid.UUID, *, kind: str, title:
     return True
 
 
-async def exists(db: AsyncSession, user_id: uuid.UUID, dedupe_key: str) -> bool:
-    return bool(await db.scalar(select(Notification.id).where(
-        Notification.user_id == user_id, Notification.dedupe_key == dedupe_key
-    )))
-
-
 async def _unread(db: AsyncSession, user_id: uuid.UUID) -> int:
     return await db.scalar(select(func.count()).select_from(Notification).where(
         Notification.user_id == user_id, Notification.read_at.is_(None)

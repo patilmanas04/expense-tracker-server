@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 import httpx
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 import limits
 import mailer
@@ -313,6 +313,39 @@ class LimitsApiTests(GoogleTestCase):
         [alert] = await self.alerts()
         self.assertEqual((alert.status, alert.attempts), ("sent", 2))
         self.assertIn("₹610.00", body_text(self.google.sent[0]))
+
+    async def test_summary_is_a_single_query(self):
+        # The database can be a continent away (~250 ms a round trip), so the summary
+        # mustn't grow a query per period or per check.
+        self.sign_in()
+        await self.set_limits(weekly="500", monthly="800")
+        self.google.send_failures = 2
+        await self.debit("900.00")  # crosses both limits; both emails fail
+        statements = []
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        async with AsyncSessionLocal() as db:
+            setting = await limits._setting(db, self.owner.id)
+            event.listen(engine.sync_engine, "before_cursor_execute", record)
+            try:
+                summary = await limits.summarize(db, self.owner, setting)
+            finally:
+                event.remove(engine.sync_engine, "before_cursor_execute", record)
+        self.assertEqual(len(statements), 1, statements)
+        self.assertEqual((summary.weekly.spent, summary.monthly.spent), (900, 900))
+        self.assertTrue(summary.weekly.alerted and summary.monthly.alerted)
+        self.assertIn("Backend Error", summary.email.last_error)
+
+    async def test_summary_without_limits(self):
+        self.sign_in()
+        await self.debit("120.00")
+        data = (await self.client.get("/api/v1/limits")).json()
+        self.assertEqual((data["currency"], data["weekly"]["limit"], data["monthly"]["limit"]), ("INR", None, None))
+        self.assertEqual((data["weekly"]["spent"], data["monthly"]["spent"]), (120, 120))
+        self.assertFalse(data["weekly"]["alerted"] or data["monthly"]["alerted"])
+        self.assertIsNone(data["email"]["last_error"])
 
     async def test_no_email_or_alert_record_when_gmail_is_not_configured(self):
         self.sign_in()

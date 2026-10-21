@@ -1,6 +1,7 @@
 """Running bank balance: the amount the owner enters, adjusted by every parsed
 transaction recorded after it. Credit-card alerts are skipped because card spends
-leave the bank account only when the card bill is paid, which is its own debit SMS."""
+leave the bank account only when the card bill is paid, which is its own debit SMS.
+Cash entries added by hand are skipped too: they never pass through the bank."""
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,6 +29,7 @@ CARD_RE = re.compile(
     re.IGNORECASE,
 )
 BANK_ACCOUNT_RE = re.compile(r"\b(?:a/c|acct|acc|account)\b", re.IGNORECASE)
+CASH_ACCOUNT = "Cash"  # account_ref of a transaction added by hand and paid in cash
 
 
 def affects_bank_balance(raw_message: str) -> bool:
@@ -64,7 +66,7 @@ class BalanceSummary(BaseModel):
 
 async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> BalanceSummary:
     rows = (await db.execute(
-        select(Transaction.type, Transaction.amount, Transaction.raw_message).where(
+        select(Transaction.type, Transaction.amount, Transaction.raw_message, Transaction.account_ref).where(
             ownership(user),
             Transaction.is_parsed.is_(True),
             Transaction.currency == setting.currency,
@@ -73,7 +75,9 @@ async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> Ba
     )).all()
     spent = received = Decimal(0)
     counted = excluded = 0
-    for kind, amount, raw_message in rows:
+    for kind, amount, raw_message, account_ref in rows:
+        if account_ref == CASH_ACCOUNT:
+            continue
         if not affects_bank_balance(raw_message):
             excluded += 1
             continue

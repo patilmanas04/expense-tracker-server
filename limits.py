@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import exists, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,8 +22,8 @@ import mailer
 from auth import FRONTEND_URL, OWNER_EMAIL, current_user, same_origin
 from dashboard import ownership
 from database import AsyncSessionLocal, get_db
-from models import SpendAlert, SpendLimit, Transaction, User
-from notifications import create_once, exists as notification_exists
+from models import Notification, SpendAlert, SpendLimit, Transaction, User
+from notifications import create_once
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -80,16 +80,23 @@ def format_money(amount: Decimal, currency: str) -> str:
     return f"{sign}₹{whole}.{fraction}" if currency == "INR" else f"{sign}{currency} {whole}.{fraction}"
 
 
-async def spent_between(db: AsyncSession, user: User, currency: str, start: datetime, end: datetime) -> Decimal:
-    total = await db.scalar(select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+def _spent_query(user: User, currency: str, start: datetime, end: datetime):
+    return select(func.coalesce(func.sum(Transaction.amount), 0)).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
         Transaction.currency == currency,
         Transaction.transaction_time >= start,
         Transaction.transaction_time < end,
-    ))
+    )
+
+
+def _money(total) -> Decimal:
     return Decimal(str(total)).quantize(Decimal("0.01"))
+
+
+async def spent_between(db: AsyncSession, user: User, currency: str, start: datetime, end: datetime) -> Decimal:
+    return _money(await db.scalar(_spent_query(user, currency, start, end)))
 
 
 async def _setting(db: AsyncSession, user_id: uuid.UUID) -> Optional[SpendLimit]:
@@ -148,22 +155,41 @@ class LimitsSummary(BaseModel):
 
 
 async def summarize(db: AsyncSession, user: User, setting: Optional[SpendLimit]) -> LimitsSummary:
+    """Both meters in a single query: the database may be a continent away, so each
+    round trip costs far more than the work itself."""
     now = utc_now()
     currency = setting.currency if setting else "INR"
+    windows = {period: period_window(period, now) for period in PERIODS}
+    amounts = {period: getattr(setting, f"{period}_limit") if setting else None for period in PERIODS}
+
+    columns = []
+    for period in PERIODS:
+        start_date, start, end = windows[period]
+        limit = amounts[period]
+        columns.append(_spent_query(user, currency, start, end).scalar_subquery().label(f"{period}_spent"))
+        if limit:
+            columns.append(exists().where(
+                Notification.user_id == user.id,
+                Notification.dedupe_key == _notification_key(period, start_date, limit),
+            ).label(f"{period}_alerted"))
+            columns.append(select(SpendAlert.error).where(
+                *_alert_key(user.id, period, start_date, limit), SpendAlert.status == "failed",
+            ).scalar_subquery().label(f"{period}_error"))
+    row = (await db.execute(select(*columns))).one()._mapping
+
     periods: dict[str, PeriodStatus] = {}
     last_error = None
     for period in PERIODS:
-        start_date, start, end = period_window(period, now)
-        limit = getattr(setting, f"{period}_limit") if setting else None
-        alert = await db.scalar(select(SpendAlert).where(*_alert_key(user.id, period, start_date, limit))) if limit else None
-        if alert is not None and alert.status == "failed":
-            last_error = alert.error
+        start_date, _, end = windows[period]
+        limit = amounts[period]
+        if limit and row[f"{period}_error"] is not None:
+            last_error = row[f"{period}_error"]
         periods[period] = PeriodStatus(
             limit=float(limit) if limit else None,
-            spent=float(await spent_between(db, user, currency, start, end)),
+            spent=float(_money(row[f"{period}_spent"])),
             start=start_date,
             end=_last_day(end),
-            alerted=bool(limit) and await notification_exists(db, user.id, _notification_key(period, start_date, limit)),
+            alerted=bool(limit) and bool(row[f"{period}_alerted"]),
         )
     return LimitsSummary(
         currency=currency,
