@@ -406,3 +406,86 @@ class Notification(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "dedupe_key", name="uq_notification_once"),
     )
+
+
+class MerchantCategory(Base):
+    """A category you picked for a merchant (by editing or adding a transaction). Later SMS from the
+    same merchant get it too, ahead of the keyword rules."""
+
+    __tablename__ = "merchant_categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    merchant_key: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # lower-case, single-spaced merchant name, e.g. "hungerbox"
+    type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )  # DEBIT or CREDIT: paying a merchant and a refund from it differ
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "merchant_key", "type", name="uq_merchant_category"),
+    )
+
+
+class CategoryLimit(Base):
+    """Weekly/monthly spending limit for one category. The overall ("All") limit is SpendLimit."""
+
+    __tablename__ = "category_limits"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    weekly_limit: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(14, 2),
+        nullable=True,
+    )  # None = no limit
+    monthly_limit: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(14, 2),
+        nullable=True,
+    )
+    currency: Mapped[str] = mapped_column(
+        String(10),
+        default="INR",
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "category", name="uq_category_limit"),
+    )
+

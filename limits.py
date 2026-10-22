@@ -1,5 +1,6 @@
-"""Weekly and monthly spend limits. The first time each is reached, an in-app notification
-is created (bell on Home), plus a Gmail alert if GMAIL_* keys are configured (optional).
+"""Weekly and monthly spend limits, overall ("All") and per category. The first time each is
+reached, an in-app notification is created (bell on Home), plus a Gmail alert if GMAIL_* keys
+are configured (optional; retried for overall limits, best effort for category limits).
 
 "Spent" matches the dashboard: parsed debits in the limit's currency, card spends included.
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
@@ -8,13 +9,14 @@ import html
 import logging
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import exists, func, select, update
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import String, delete, exists, func, literal, select, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,8 +24,9 @@ import mailer
 from auth import FRONTEND_URL, OWNER_EMAIL, current_user, same_origin
 from dashboard import ownership
 from database import AsyncSessionLocal, get_db
-from models import Notification, SpendAlert, SpendLimit, Transaction, User
+from models import CategoryLimit, Notification, SpendAlert, SpendLimit, Transaction, User
 from notifications import create_once
+from parser import CATEGORIES, UNCATEGORIZED
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -32,6 +35,9 @@ IST = ZoneInfo("Asia/Kolkata")
 PERIODS = ("weekly", "monthly")
 MAX_ATTEMPTS = 3  # a failed email is retried on the next payments, up to this many tries
 MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
+ALL = "All"  # the overall limit, across every category
+# Limits apply to spending, so money-in categories (and Uncategorized) can't have one.
+LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary & Income", "Refunds & Cashback")]
 
 
 def utc_now() -> datetime:
@@ -80,8 +86,8 @@ def format_money(amount: Decimal, currency: str) -> str:
     return f"{sign}₹{whole}.{fraction}" if currency == "INR" else f"{sign}{currency} {whole}.{fraction}"
 
 
-def _spent_query(user: User, currency: str, start: datetime, end: datetime):
-    return select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+def _spent_query(user: User, currency: str, start: datetime, end: datetime, category: Optional[str] = None):
+    query = select(func.coalesce(func.sum(Transaction.amount), 0)).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
@@ -89,23 +95,49 @@ def _spent_query(user: User, currency: str, start: datetime, end: datetime):
         Transaction.transaction_time >= start,
         Transaction.transaction_time < end,
     )
+    return query.where(Transaction.category == category) if category else query
 
 
 def _money(total) -> Decimal:
     return Decimal(str(total)).quantize(Decimal("0.01"))
 
 
-async def spent_between(db: AsyncSession, user: User, currency: str, start: datetime, end: datetime) -> Decimal:
-    return _money(await db.scalar(_spent_query(user, currency, start, end)))
+async def spent_between(db: AsyncSession, user: User, currency: str, start: datetime, end: datetime,
+                        category: Optional[str] = None) -> Decimal:
+    return _money(await db.scalar(_spent_query(user, currency, start, end, category)))
 
 
 async def _setting(db: AsyncSession, user_id: uuid.UUID) -> Optional[SpendLimit]:
     return await db.scalar(select(SpendLimit).where(SpendLimit.user_id == user_id))
 
 
-def _notification_key(period: str, start: date, limit: Decimal) -> str:
+def _notification_key(period: str, start: date, limit: Decimal, category: Optional[str] = None) -> str:
     # The limit is part of the key, so raising a limit mid-period notifies again.
-    return f"spend_limit:{period}:{start.isoformat()}:{Decimal(limit):.2f}"
+    scope = f"{category}:" if category else ""
+    return f"spend_limit:{scope}{period}:{start.isoformat()}:{Decimal(limit):.2f}"
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A limit you've set: overall (category "All") or for one category."""
+
+    category: str
+    currency: str
+    weekly_limit: Optional[Decimal]
+    monthly_limit: Optional[Decimal]
+
+
+async def load_rules(db: AsyncSession, user_id: uuid.UUID) -> list[Rule]:
+    """The overall limit and every category limit, in one query. Overall first, then list order."""
+    overall = select(
+        literal(ALL, String).label("category"), SpendLimit.currency, SpendLimit.weekly_limit, SpendLimit.monthly_limit
+    ).where(SpendLimit.user_id == user_id)
+    per_category = select(
+        CategoryLimit.category, CategoryLimit.currency, CategoryLimit.weekly_limit, CategoryLimit.monthly_limit
+    ).where(CategoryLimit.user_id == user_id)
+    rules = [Rule(*row) for row in (await db.execute(union_all(overall, per_category))).all()]
+    order = {name: i for i, name in enumerate([ALL, *LIMIT_CATEGORIES])}
+    return sorted(rules, key=lambda rule: order.get(rule.category, len(order)))
 
 
 def _window_text(start: date, end_utc: datetime) -> str:
@@ -129,8 +161,20 @@ def _limit_field():
 
 
 class LimitsInput(BaseModel):
+    category: Optional[str] = Field(default=None, description='A spending category; omit or "All" for overall spending')
     weekly_limit: Optional[Decimal] = _limit_field()  # null = no limit
     monthly_limit: Optional[Decimal] = _limit_field()
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, value: Optional[str]) -> Optional[str]:
+        wanted = (value or "").strip().casefold()
+        if not wanted or wanted == ALL.casefold():
+            return None  # overall
+        match = next((c for c in LIMIT_CATEGORIES if c.casefold() == wanted), None)
+        if match is None:
+            raise ValueError("Pick a spending category, or All.")
+        return match
 
 
 class PeriodStatus(BaseModel):
@@ -147,82 +191,122 @@ class EmailStatus(BaseModel):
     last_error: Optional[str]
 
 
-class LimitsSummary(BaseModel):
-    currency: str
+class CategoryStatus(BaseModel):
+    category: str
     weekly: PeriodStatus
     monthly: PeriodStatus
+
+
+class LimitsSummary(BaseModel):
+    currency: str
+    weekly: PeriodStatus  # overall
+    monthly: PeriodStatus
+    categories: list[CategoryStatus] = []  # only categories with a limit
     email: EmailStatus
 
 
-async def summarize(db: AsyncSession, user: User, setting: Optional[SpendLimit]) -> LimitsSummary:
-    """Both meters in a single query: the database may be a continent away, so each
-    round trip costs far more than the work itself."""
+async def summarize(db: AsyncSession, user: User, rules: list[Rule]) -> LimitsSummary:
+    """Every meter, overall and per category, in a single query: the database may be a continent
+    away, so each round trip costs far more than the work itself."""
     now = utc_now()
-    currency = setting.currency if setting else "INR"
+    overall = next((rule for rule in rules if rule.category == ALL), None)
+    per_category = [rule for rule in rules if rule.category != ALL]
+    currency = overall.currency if overall else "INR"
     windows = {period: period_window(period, now) for period in PERIODS}
-    amounts = {period: getattr(setting, f"{period}_limit") if setting else None for period in PERIODS}
 
+    def amounts(rule: Optional[Rule]) -> dict[str, Optional[Decimal]]:
+        return {period: getattr(rule, f"{period}_limit") if rule else None for period in PERIODS}
+
+    # (column prefix, category or None for overall, currency, limits)
+    meters = [("all", None, currency, amounts(overall))]
+    meters += [(f"c{i}", rule.category, rule.currency, amounts(rule)) for i, rule in enumerate(per_category)]
     columns = []
-    for period in PERIODS:
-        start_date, start, end = windows[period]
-        limit = amounts[period]
-        columns.append(_spent_query(user, currency, start, end).scalar_subquery().label(f"{period}_spent"))
-        if limit:
+    for prefix, category, meter_currency, limits in meters:
+        for period in PERIODS:
+            start_date, start, end = windows[period]
+            limit = limits[period]
+            columns.append(_spent_query(user, meter_currency, start, end, category).scalar_subquery().label(f"{prefix}_{period}_spent"))
+            if not limit:
+                continue
             columns.append(exists().where(
                 Notification.user_id == user.id,
-                Notification.dedupe_key == _notification_key(period, start_date, limit),
-            ).label(f"{period}_alerted"))
-            columns.append(select(SpendAlert.error).where(
-                *_alert_key(user.id, period, start_date, limit), SpendAlert.status == "failed",
-            ).scalar_subquery().label(f"{period}_error"))
+                Notification.dedupe_key == _notification_key(period, start_date, limit, category),
+            ).label(f"{prefix}_{period}_alerted"))
+            if category is None:  # emails for overall limits are tracked (and retried)
+                columns.append(select(SpendAlert.error).where(
+                    *_alert_key(user.id, period, start_date, limit), SpendAlert.status == "failed",
+                ).scalar_subquery().label(f"{prefix}_{period}_error"))
     row = (await db.execute(select(*columns))).one()._mapping
 
-    periods: dict[str, PeriodStatus] = {}
-    last_error = None
-    for period in PERIODS:
-        start_date, _, end = windows[period]
-        limit = amounts[period]
-        if limit and row[f"{period}_error"] is not None:
-            last_error = row[f"{period}_error"]
-        periods[period] = PeriodStatus(
-            limit=float(limit) if limit else None,
-            spent=float(_money(row[f"{period}_spent"])),
-            start=start_date,
-            end=_last_day(end),
-            alerted=bool(limit) and bool(row[f"{period}_alerted"]),
-        )
+    def statuses(prefix: str, limits: dict[str, Optional[Decimal]]) -> dict[str, PeriodStatus]:
+        out = {}
+        for period in PERIODS:
+            start_date, _, end = windows[period]
+            limit = limits[period]
+            out[period] = PeriodStatus(
+                limit=float(limit) if limit else None,
+                spent=float(_money(row[f"{prefix}_{period}_spent"])),
+                start=start_date,
+                end=_last_day(end),
+                alerted=bool(limit) and bool(row[f"{prefix}_{period}_alerted"]),
+            )
+        return out
+
+    overall_limits = meters[0][3]
+    # The monthly failure wins over the weekly one, as before.
+    last_error = next((row[f"all_{period}_error"] for period in reversed(PERIODS)
+                       if overall_limits[period] and row[f"all_{period}_error"] is not None), None)
+    overall_status = statuses("all", overall_limits)
+    categories = []
+    for prefix, category, _, limits in meters[1:]:
+        status = statuses(prefix, limits)
+        categories.append(CategoryStatus(category=category, weekly=status["weekly"], monthly=status["monthly"]))
     return LimitsSummary(
         currency=currency,
-        weekly=periods["weekly"],
-        monthly=periods["monthly"],
+        weekly=overall_status["weekly"],
+        monthly=overall_status["monthly"],
+        categories=categories,
         email=EmailStatus(configured=mailer.configured(), to=mailer.recipient() or None, last_error=last_error),
     )
 
 
 @router.get("", response_model=LimitsSummary)
 async def get_limits(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    return await summarize(db, user, await _setting(db, user.id))
+    return await summarize(db, user, await load_rules(db, user.id))
 
 
 @router.put("", response_model=LimitsSummary, dependencies=[Depends(same_origin)])
 async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    async def save() -> SpendLimit:
-        setting = await _setting(db, user.id)
-        if setting is None:
-            setting = SpendLimit(user_id=user.id, currency="INR")
-            db.add(setting)
-        setting.weekly_limit = body.weekly_limit
-        setting.monthly_limit = body.monthly_limit
+    """Sets the overall limit, or one category's when `category` is given. Leaving both amounts
+    empty removes a category's limit."""
+    category = body.category
+    if category and body.weekly_limit is None and body.monthly_limit is None:
+        await db.execute(delete(CategoryLimit).where(CategoryLimit.user_id == user.id, CategoryLimit.category == category))
         await db.commit()
-        return setting
+        return await summarize(db, user, await load_rules(db, user.id))
+
+    async def save() -> None:
+        if category:
+            rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == user.id, CategoryLimit.category == category))
+            if rule is None:
+                rule = CategoryLimit(user_id=user.id, category=category, currency="INR")
+                db.add(rule)
+            rule.updated_at = utc_now()
+        else:
+            rule = await _setting(db, user.id)
+            if rule is None:
+                rule = SpendLimit(user_id=user.id, currency="INR")
+                db.add(rule)
+        rule.weekly_limit = body.weekly_limit
+        rule.monthly_limit = body.monthly_limit
+        await db.commit()
 
     try:
-        setting = await save()
+        await save()
     except IntegrityError:
         await db.rollback()  # two saves raced to create the row; update the winner
-        setting = await save()
-    await db.refresh(setting)
-    return await summarize(db, user, setting)
+        await save()
+    return await summarize(db, user, await load_rules(db, user.id))
 
 
 @router.post("/test-email", dependencies=[Depends(same_origin)])
@@ -256,10 +340,17 @@ def _html_email(heading: str, body: str) -> str:
     )
 
 
-def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_utc: datetime,
-                  txn: Transaction, currency: str) -> tuple[str, str, str]:
-    """Subject, plain text and HTML for a limit alert."""
+def _limit_name(period: str, category: Optional[str]) -> str:
+    """ "Weekly spend limit" overall, "Weekly Food & Dining limit" for a category."""
     label = "Weekly" if period == "weekly" else "Monthly"
+    return f"{label} {category or 'spend'} limit"
+
+
+def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_utc: datetime,
+                  txn: Transaction, currency: str, category: Optional[str] = None) -> tuple[str, str, str]:
+    """Subject, plain text and HTML for a limit alert."""
+    name = _limit_name(period, category)
+    on = f" on {category}" if category else ""
     noun = "week" if period == "weekly" else "month"
     state = "reached" if spent == limit else "crossed"
     percent = int(spent * 100 / limit)
@@ -271,20 +362,20 @@ def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_
     latest = f"{format_money(txn.amount, txn.currency)} at {latest_where}{account}, {when.day} {when:%b}, {clock}"
     spent_text, limit_text = format_money(spent, currency), format_money(limit, currency)
 
-    subject = f"{label} spend limit {state}: {spent_text} of {limit_text}"
+    subject = f"{name} {state}: {spent_text} of {limit_text}"
     text = (
-        f"You've spent {spent_text} this {noun} ({window}), {percent}% of your {limit_text} {noun}ly limit.\n\n"
+        f"You've spent {spent_text}{on} this {noun} ({window}), {percent}% of your {limit_text} {name.lower()}.\n\n"
         f"Latest payment: {latest}.\n\n"
         f"Open Folio: {FRONTEND_URL}\n\n"
         f"You get one email per limit each {noun}. Change limits in Folio → Settings.\n"
     )
     body = (
-        f"<p>You've spent <strong>{spent_text}</strong> this {noun} ({window}), "
-        f"<strong>{percent}%</strong> of your {limit_text} {noun}ly limit.</p>"
+        f"<p>You've spent <strong>{spent_text}</strong>{html.escape(on)} this {noun} ({window}), "
+        f"<strong>{percent}%</strong> of your {limit_text} {html.escape(name.lower())}.</p>"
         f"<p style='color:#6e6e78'>Latest payment: {html.escape(latest)}.</p>"
         f"<p style='color:#6e6e78;font-size:13px'>You get one email per limit each {noun}. Change limits in Folio → Settings.</p>"
     )
-    return subject, text, _html_email(html.escape(f"{label} spend limit {state}"), body)
+    return subject, text, _html_email(html.escape(f"{name} {state}"), body)
 
 
 async def _alert_once(db: AsyncSession, user: User, period: str, start: date, end: datetime,
@@ -323,17 +414,19 @@ async def _alert_once(db: AsyncSession, user: User, period: str, start: date, en
 
 
 async def _notify_once(db: AsyncSession, user: User, period: str, start: date, end: datetime,
-                       limit: Decimal, spent: Decimal, currency: str) -> None:
-    label, noun = ("Weekly", "week") if period == "weekly" else ("Monthly", "month")
+                       limit: Decimal, spent: Decimal, currency: str, category: Optional[str] = None) -> bool:
+    """True if the notification is new (it's only ever created once per limit and period)."""
+    noun = "week" if period == "weekly" else "month"
     state = "reached" if spent == limit else "crossed"
-    await create_once(
+    on = f" on {category}" if category else ""
+    return await create_once(
         db, user.id,
         kind="spend_limit",
-        title=f"{label} spend limit {state}",
-        body=(f"{format_money(spent, currency)} of {format_money(limit, currency)} this {noun} "
+        title=f"{_limit_name(period, category)} {state}",
+        body=(f"{format_money(spent, currency)} of {format_money(limit, currency)}{on} this {noun} "
               f"({_window_text(start, end)}) · {int(spent * 100 / limit)}%"),
         link="/settings#limits",
-        dedupe_key=_notification_key(period, start, limit),
+        dedupe_key=_notification_key(period, start, limit, category),
     )
 
 
@@ -346,28 +439,54 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
     owner = await db.scalar(select(User).where(User.email == OWNER_EMAIL))
     if owner is None or txn.user_id not in (None, owner.id):
         return
-    setting = await _setting(db, owner.id)
-    if setting is None or txn.currency != setting.currency:
-        return
     now, when = utc_now(), _utc(txn.transaction_time)
+    setting = await _setting(db, owner.id)
+    if setting is not None and txn.currency == setting.currency:
+        for period in PERIODS:
+            limit = getattr(setting, f"{period}_limit")
+            if limit is None:
+                continue
+            start_date, start, end = period_window(period, now)
+            if not start <= when < end:
+                continue  # a late SMS for a past week/month doesn't alert
+            spent = await spent_between(db, owner, setting.currency, start, end)
+            if spent < limit:
+                continue
+            await _notify_once(db, owner, period, start_date, end, limit, spent, setting.currency)
+            # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
+            if mailer.configured():
+                await _alert_once(db, owner, period, start_date, end, limit, spent, txn, setting.currency)
+    await _check_category(db, owner, txn, now, when)
+
+
+async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
+    """The limit on this transaction's category: a notification, plus one best-effort email."""
+    if txn.category not in LIMIT_CATEGORIES:
+        return
+    rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category))
+    if rule is None or rule.currency != txn.currency:
+        return
     for period in PERIODS:
-        limit = getattr(setting, f"{period}_limit")
+        limit = getattr(rule, f"{period}_limit")
         if limit is None:
             continue
         start_date, start, end = period_window(period, now)
         if not start <= when < end:
-            continue  # a late SMS for a past week/month doesn't alert
-        spent = await spent_between(db, owner, setting.currency, start, end)
+            continue
+        spent = await spent_between(db, owner, rule.currency, start, end, rule.category)
         if spent < limit:
             continue
-        await _notify_once(db, owner, period, start_date, end, limit, spent, setting.currency)
-        # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
-        if mailer.configured():
-            await _alert_once(db, owner, period, start_date, end, limit, spent, txn, setting.currency)
+        if await _notify_once(db, owner, period, start_date, end, limit, spent, rule.currency, rule.category) and mailer.configured():
+            try:
+                subject, text, body = compose_alert(period, limit, spent, start_date, end, txn, rule.currency, rule.category)
+                await mailer.send_email(mailer.recipient(), subject, text, body)
+            except Exception as error:  # noqa: BLE001 - the notification already went out
+                logger.warning("Category limit email failed: %s", error)
 
 
 async def check_spend_limits(transaction_id: uuid.UUID) -> None:
-    """Background task after a webhook insert. Never raises: alerts must not affect recording."""
+    """Background task after a transaction is recorded, edited or categorised. Never raises:
+    alerts must not affect recording."""
     try:
         async with AsyncSessionLocal() as db:
             await _check(db, transaction_id)

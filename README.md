@@ -64,7 +64,18 @@ Create a Message automation for your bank sender, then **Get Contents of URL**, 
 
 ## Live updates
 
-`GET /api/v1/transactions?created_after=<ISO time with timezone>` returns only rows recorded at or after that time. The dashboard polls it every 5 seconds. The webhook stamps `created_at` right before inserting, after any Gemini call, so slow AI-parsed SMS aren't skipped by the polling cursor.
+`GET /api/v1/transactions?updated_after=<ISO time with timezone>` returns only rows added **or changed** at or after that time: new SMS, your edits, and categories filled in later by the background retry. The dashboard polls it every 5 seconds. `created_after` still works for new rows only. The server stamps `created_at`/`updated_at` itself, right before writing (after any Gemini call), so the polling cursor never skips a slow row.
+
+## Categories
+
+Each SMS gets its category from, in order:
+
+1. **Your category for that merchant.** Editing a transaction's category (or picking one when adding by hand) saves it in `merchant_categories`, per merchant and direction (paying vs. money in). It beats the keyword rules. Choosing Uncategorized forgets it.
+2. **The keyword rules** in `parser.py`.
+3. **Your earlier payments** to the same merchant: the category of the latest categorised one.
+4. **Gemini**, waited on for at most 5 s so the Shortcut stays quick. If it's slower or failing, the SMS is saved Uncategorized and a background task retries with a 30 s limit (right away, then after 1 and 5 minutes) and fills the category in. An edit you make meanwhile always wins. Retries live in the server process, so a restart during those minutes drops them; the transaction just stays Uncategorized for you to set.
+
+`parsed_by` records where the category came from: `regex`, `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
 
 ## Bank balance
 
@@ -91,14 +102,26 @@ The dashboard's Activity page has **Add** for cash and anything that never sent 
 POST   /api/v1/transactions        {"type": "DEBIT", "amount": "249.50", "merchant": "Chai Point",
                                     "transaction_time": "2026-10-22T19:30:00+05:30",
                                     "category": null, "paid_with": "cash"}
+PATCH  /api/v1/transactions/{id}   any of: type, amount, merchant, category, transaction_time,
+                                    paid_with (hand-added entries only); only the fields sent change
 DELETE /api/v1/transactions/{id}   -> 204; only for entries added by hand (403 for bank SMS)
 ```
 
-Both need the dashboard session and `Origin`. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
+All three need the dashboard session and `Origin`. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
 
 ## Spend limits, notifications and (optional) email alerts
 
 Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the dashboard: parsed debits, card spends included. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+
+**Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary & Income, Refunds & Cashback) and Uncategorized can't have limits. With Gmail set up, a category alert also sends one email, best effort (not retried).
+
+```http
+GET /api/v1/limits   -> overall `weekly`/`monthly`, plus `categories`: [{category, weekly, monthly}]
+PUT /api/v1/limits   {"weekly_limit": "5000", "monthly_limit": null}                            (overall)
+PUT /api/v1/limits   {"category": "Food & Dining", "weekly_limit": "1500", "monthly_limit": null}
+```
+
+Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start. The summary is two queries however many limits you set.
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.
 

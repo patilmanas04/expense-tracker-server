@@ -20,7 +20,7 @@ import unittest
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from httpx import ASGITransport, AsyncClient
@@ -175,8 +175,9 @@ class LimitsApiTests(GoogleTestCase):
     def sign_in(self):
         app.dependency_overrides[current_user] = lambda: self.owner
 
-    async def set_limits(self, weekly=None, monthly=None):
-        response = await self.client.put("/api/v1/limits", json={"weekly_limit": weekly, "monthly_limit": monthly}, headers=ORIGIN)
+    async def set_limits(self, weekly=None, monthly=None, category=None):
+        body = {"weekly_limit": weekly, "monthly_limit": monthly, **({"category": category} if category else {})}
+        response = await self.client.put("/api/v1/limits", json=body, headers=ORIGIN)
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
@@ -319,24 +320,108 @@ class LimitsApiTests(GoogleTestCase):
         # mustn't grow a query per period or per check.
         self.sign_in()
         await self.set_limits(weekly="500", monthly="800")
-        self.google.send_failures = 2
-        await self.debit("900.00")  # crosses both limits; both emails fail
+        await self.set_limits(weekly="100", category="Food & Dining")
+        await self.set_limits(monthly="5000", category="Shopping")
+        self.google.send_failures = 3
+        await self.debit("900.00")  # crosses both overall limits and Food's; the emails fail
         statements = []
 
         def record(conn, cursor, statement, *args):
             statements.append(statement)
 
         async with AsyncSessionLocal() as db:
-            setting = await limits._setting(db, self.owner.id)
             event.listen(engine.sync_engine, "before_cursor_execute", record)
             try:
-                summary = await limits.summarize(db, self.owner, setting)
+                rules = await limits.load_rules(db, self.owner.id)
+                summary = await limits.summarize(db, self.owner, rules)
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", record)
-        self.assertEqual(len(statements), 1, statements)
+        # One query for the limits you've set, one for every meter, however many categories.
+        self.assertEqual(len(statements), 2, statements)
         self.assertEqual((summary.weekly.spent, summary.monthly.spent), (900, 900))
         self.assertTrue(summary.weekly.alerted and summary.monthly.alerted)
         self.assertIn("Backend Error", summary.email.last_error)
+        food, shopping = summary.categories
+        self.assertEqual((food.category, food.weekly.limit, food.weekly.spent, food.weekly.alerted), ("Food & Dining", 100, 900, True))
+        self.assertEqual((shopping.category, shopping.monthly.limit, shopping.monthly.spent, shopping.monthly.alerted), ("Shopping", 5000, 0, False))
+
+    async def test_category_limits_are_saved_and_summarised(self):
+        self.sign_in()
+        await self.debit("150.00", merchant="SWIGGY")  # Food & Dining
+        await self.debit("999.00", merchant="AMAZON")  # Shopping: never counts toward Food
+        data = await self.set_limits(weekly="500", category="food & dining")
+        self.assertEqual((data["weekly"]["limit"], data["monthly"]["limit"]), (None, None))  # overall untouched
+        [food] = data["categories"]
+        self.assertEqual(food["category"], "Food & Dining")
+        self.assertEqual((food["weekly"]["limit"], food["weekly"]["spent"], food["weekly"]["alerted"]), (500, 150, False))
+        self.assertEqual((food["monthly"]["limit"], food["monthly"]["spent"]), (None, 150))
+        self.assertEqual((food["weekly"]["start"], food["weekly"]["end"]), ("2026-10-19", "2026-10-25"))
+        # Overall and per-category limits live side by side
+        data = await self.set_limits(weekly="5000", monthly="20000")
+        self.assertEqual((data["weekly"]["limit"], data["weekly"]["spent"], len(data["categories"])), (5000, 1149, 1))
+        # Clearing both amounts removes a category's limit
+        data = await self.set_limits(category="Food & Dining")
+        self.assertEqual(data["categories"], [])
+        self.assertEqual(data["weekly"]["limit"], 5000)
+
+    async def test_category_limit_validation(self):
+        self.sign_in()
+        for category in ["Snacks", "Salary & Income", "Refunds & Cashback", "Uncategorized"]:
+            with self.subTest(category=category):
+                response = await self.client.put("/api/v1/limits", headers=ORIGIN,
+                                                 json={"category": category, "weekly_limit": "100", "monthly_limit": None})
+                self.assertEqual(response.status_code, 422, response.text)
+        overall = await self.set_limits(weekly="300", category="All")  # "All" is the overall limit
+        self.assertEqual((overall["weekly"]["limit"], overall["categories"]), (300, []))
+
+    async def test_crossing_a_category_limit_notifies_once(self):
+        self.sign_in()
+        await self.set_limits(weekly="400", category="Food & Dining")
+        await self.debit("300.00", merchant="SWIGGY")
+        await self.debit("2000.00", merchant="AMAZON")  # other categories don't count
+        self.assertEqual((await self.client.get("/api/v1/notifications")).json()["unread"], 0)
+        await self.debit("150.00", merchant="ZOMATO")  # 450 >= 400
+        inbox = (await self.client.get("/api/v1/notifications")).json()
+        [note] = inbox["items"]
+        self.assertEqual(note["title"], "Weekly Food & Dining limit crossed")
+        self.assertIn("₹450.00 of ₹400.00 on Food & Dining this week", note["body"])
+        self.assertEqual(note["link"], "/settings#limits")
+        [mail] = self.google.sent  # an email too, when Gmail is set up
+        self.assertIn("Weekly Food & Dining limit crossed", mail["Subject"])
+        await self.debit("10.00", merchant="SWIGGY")
+        self.assertEqual((await self.client.get("/api/v1/notifications")).json()["unread"], 1)
+        self.assertTrue((await self.client.get("/api/v1/limits")).json()["categories"][0]["weekly"]["alerted"])
+
+    async def test_overall_and_category_limits_alert_independently(self):
+        self.sign_in()
+        await self.set_limits(weekly="1000")
+        await self.set_limits(weekly="200", category="Food & Dining")
+        await self.debit("250.00", merchant="SWIGGY")
+        titles = [n["title"] for n in (await self.client.get("/api/v1/notifications")).json()["items"]]
+        self.assertEqual(titles, ["Weekly Food & Dining limit crossed"])
+        await self.debit("800.00", merchant="AMAZON")
+        titles = [n["title"] for n in (await self.client.get("/api/v1/notifications")).json()["items"]]
+        self.assertEqual(sorted(titles), ["Weekly Food & Dining limit crossed", "Weekly spend limit crossed"])
+
+    async def test_recategorising_into_a_limited_category_notifies(self):
+        self.sign_in()
+        await self.set_limits(weekly="500", category="Food & Dining")
+        await self.debit("300.00", merchant="SWIGGY")
+        await self.debit("400.00", merchant="AMAZON")
+        [amazon] = [t for t in (await self.client.get("/api/v1/transactions")).json() if t["category"] == "Shopping"]
+        await self.client.patch(f"/api/v1/transactions/{amazon['id']}", json={"category": "Food & Dining"}, headers=ORIGIN)
+        titles = [n["title"] for n in (await self.client.get("/api/v1/notifications")).json()["items"]]
+        self.assertEqual(titles, ["Weekly Food & Dining limit crossed"])
+
+    async def test_a_category_filled_in_later_counts_toward_its_limit(self):
+        self.sign_in()
+        await self.set_limits(weekly="100", category="Food & Dining")
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), patch("categorize.RETRY_DELAYS", (0,)), \
+                patch("parser.categorize_with_gemini", new_callable=AsyncMock, side_effect=TimeoutError), \
+                patch("categorize.categorize_with_gemini", new_callable=AsyncMock, return_value="Food & Dining"):
+            await self.debit("150.00", merchant="QWIKLY HUB")  # unknown merchant: Gemini answers late
+        titles = [n["title"] for n in (await self.client.get("/api/v1/notifications")).json()["items"]]
+        self.assertEqual(titles, ["Weekly Food & Dining limit crossed"])
 
     async def test_summary_without_limits(self):
         self.sign_in()
