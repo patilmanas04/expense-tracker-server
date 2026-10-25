@@ -104,14 +104,16 @@ POST   /api/v1/transactions        {"type": "DEBIT", "amount": "249.50", "mercha
                                     "category": null, "paid_with": "cash"}
 PATCH  /api/v1/transactions/{id}   any of: type, amount, merchant, category, transaction_time,
                                     paid_with (hand-added entries only); only the fields sent change
-DELETE /api/v1/transactions/{id}   -> 204; only for entries added by hand (403 for bank SMS)
+DELETE /api/v1/transactions/{id}   -> 204; any of your transactions, SMS or hand-added
 ```
 
-All three need the dashboard session and `Origin`. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
+All three need the dashboard session and `Origin`. A delete is permanent; if the Shortcut sends the same SMS again it's recorded again. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
 
 ## Spend limits, notifications and (optional) email alerts
 
 Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the dashboard: parsed debits, card spends included. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+
+**Clearing notifications:** `DELETE /api/v1/notifications/{id}` (swipe to delete) and `DELETE /api/v1/notifications` (Clear) hide notifications instead of deleting them (`notification_dismissals`, added by `create_all`). Each notification is also the record that its alert went out, so a cleared limit alert isn't sent again on the next payment, and the meter in Settings still says "notified".
 
 **Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary & Income, Refunds & Cashback) and Uncategorized can't have limits. With Gmail set up, a category alert also sends one email, best effort (not retried).
 

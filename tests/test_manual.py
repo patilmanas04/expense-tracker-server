@@ -126,7 +126,7 @@ class ManualTransactionTests(unittest.IsolatedAsyncioTestCase):
         inbox = (await self.client.get("/api/v1/notifications")).json()
         self.assertEqual(inbox["unread"], 1)
 
-    async def test_delete_only_your_own_manual_entries(self):
+    async def test_delete_any_of_your_transactions(self):
         self.sign_in()
         mine = (await self.add()).json()
         sms = (await self.client.post("/api/v1/webhook/sms", json={"message": HDFC_UPI_DEBIT}, headers=HOOK)).json()["transaction"]
@@ -136,15 +136,17 @@ class ManualTransactionTests(unittest.IsolatedAsyncioTestCase):
 
         foreign = await self.client.delete(f"/api/v1/transactions/{mine['id']}", headers={"Origin": "https://attacker.example"})
         self.assertEqual(foreign.status_code, 403)
-        self.assertEqual((await self.client.delete(f"/api/v1/transactions/{sms['id']}", headers=ORIGIN)).status_code, 403)
         self.assertEqual((await self.client.delete(f"/api/v1/transactions/{theirs['id']}", headers=ORIGIN)).status_code, 404)
         missing = "00000000-0000-0000-0000-000000000000"
         self.assertEqual((await self.client.delete(f"/api/v1/transactions/{missing}", headers=ORIGIN)).status_code, 404)
 
-        deleted = await self.client.delete(f"/api/v1/transactions/{mine['id']}", headers=ORIGIN)
-        self.assertEqual(deleted.status_code, 204)
-        listed = {t["id"] for t in (await self.client.get("/api/v1/transactions")).json()}
-        self.assertEqual(listed, {sms["id"]})
+        self.assertEqual((await self.client.delete(f"/api/v1/transactions/{mine['id']}", headers=ORIGIN)).status_code, 204)
+        self.assertEqual((await self.client.delete(f"/api/v1/transactions/{sms['id']}", headers=ORIGIN)).status_code, 204)
+        self.assertEqual((await self.client.get("/api/v1/transactions")).json(), [])
+        self.assertEqual((await self.client.delete(f"/api/v1/transactions/{sms['id']}", headers=ORIGIN)).status_code, 404)
+        # A deleted SMS can be recorded again if the Shortcut resends it
+        again = (await self.client.post("/api/v1/webhook/sms", json={"message": HDFC_UPI_DEBIT}, headers=HOOK)).json()
+        self.assertEqual(again["status"], "success")
 
 
 if __name__ == "__main__":

@@ -459,19 +459,18 @@ async def edit_transaction(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(same_origin)],
     tags=["Transactions"],
-    summary="Delete a transaction you added by hand",
+    summary="Delete a transaction",
 )
 async def delete_transaction(
     transaction_id: uuid.UUID,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Only hand-added entries can be deleted; bank SMS are the record of what happened."""
+    """Deletes an SMS or a hand-added entry for good. If the Shortcut sends the same SMS again,
+    it's recorded again."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
-    if txn is None or (txn.parsed_by == MANUAL and txn.user_id != user.id):
+    if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
-    if txn.parsed_by != MANUAL:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only transactions you added by hand can be deleted.")
     await db.delete(txn)
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

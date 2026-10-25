@@ -132,6 +132,48 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         app.dependency_overrides.clear()
         self.assertEqual((await self.client.get("/api/v1/notifications")).status_code, 401)
 
+    async def test_swipe_away_one_and_clear_all(self):
+        await self.set_limits(weekly="100", monthly="200")
+        await self.debit("300.00")
+        first, second = (await self.inbox())["items"]
+        gone = await self.client.delete(f"/api/v1/notifications/{first['id']}", headers=ORIGIN)
+        self.assertEqual(gone.status_code, 204)
+        inbox = await self.inbox()
+        self.assertEqual(([i["id"] for i in inbox["items"]], inbox["unread"]), ([second["id"]], 1))
+        again = await self.client.delete(f"/api/v1/notifications/{first['id']}", headers=ORIGIN)
+        self.assertEqual(again.status_code, 204)  # already gone: nothing to do
+        missing = await self.client.delete("/api/v1/notifications/00000000-0000-0000-0000-000000000000", headers=ORIGIN)
+        self.assertEqual(missing.status_code, 404)
+        cleared = await self.client.delete("/api/v1/notifications", headers=ORIGIN)
+        self.assertEqual(cleared.status_code, 204)
+        self.assertEqual(await self.inbox(), {"unread": 0, "items": []})
+
+    async def test_cleared_alerts_are_not_sent_again(self):
+        await self.set_limits(weekly="100")
+        await self.debit("300.00")
+        await self.client.delete("/api/v1/notifications", headers=ORIGIN)
+        await self.debit("50.00")  # still over the same limit: no repeat
+        self.assertEqual(await self.inbox(), {"unread": 0, "items": []})
+        limits = (await self.client.get("/api/v1/limits")).json()
+        self.assertTrue(limits["weekly"]["alerted"])  # the meter still says you were notified
+        await self.set_limits(weekly="400")  # a new limit, crossed: that's a new alert
+        await self.debit("60.00")
+        self.assertEqual([i["title"] for i in (await self.inbox())["items"]], ["Weekly spend limit crossed"])
+
+    async def test_clearing_is_private_and_needs_same_origin(self):
+        async with AsyncSessionLocal() as db:
+            db.add(Notification(user_id=self.other.id, kind="spend_limit", title="Someone else's", body="x",
+                                link="/settings#limits", dedupe_key="other", created_at=NOW))
+            await db.commit()
+            theirs = (await db.scalar(select(Notification))).id
+        self.assertEqual((await self.client.delete(f"/api/v1/notifications/{theirs}", headers=ORIGIN)).status_code, 404)
+        await self.client.delete("/api/v1/notifications", headers=ORIGIN)
+        app.dependency_overrides[current_user] = lambda: self.other
+        self.assertEqual(len((await self.inbox())["items"]), 1)  # theirs untouched by my Clear
+        foreign = {"Origin": "https://attacker.example"}
+        self.assertEqual((await self.client.delete("/api/v1/notifications", headers=foreign)).status_code, 403)
+        self.assertEqual((await self.client.delete(f"/api/v1/notifications/{theirs}", headers=foreign)).status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

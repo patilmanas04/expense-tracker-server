@@ -489,3 +489,21 @@ class CategoryLimit(Base):
         UniqueConstraint("user_id", "category", name="uq_category_limit"),
     )
 
+
+class NotificationDismissal(Base):
+    """A notification you swiped away or cleared. It's hidden, not deleted: the notification row
+    stays, so the alert it stands for still counts as sent and isn't repeated on the next payment."""
+
+    __tablename__ = "notification_dismissals"
+
+    notification_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("notifications.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    dismissed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
