@@ -366,7 +366,7 @@ class LimitsApiTests(GoogleTestCase):
 
     async def test_category_limit_validation(self):
         self.sign_in()
-        for category in ["Snacks", "Salary & Income", "Refunds & Cashback", "Uncategorized"]:
+        for category in ["Snacks", "Salary", "Income", "Refunds & Cashback", "Uncategorized"]:
             with self.subTest(category=category):
                 response = await self.client.put("/api/v1/limits", headers=ORIGIN,
                                                  json={"category": category, "weekly_limit": "100", "monthly_limit": None})

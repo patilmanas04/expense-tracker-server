@@ -148,6 +148,30 @@ class ManualTransactionTests(unittest.IsolatedAsyncioTestCase):
         again = (await self.client.post("/api/v1/webhook/sms", json={"message": HDFC_UPI_DEBIT}, headers=HOOK)).json()
         self.assertEqual(again["status"], "success")
 
+    async def test_notes_are_added_after_the_transaction_arrives(self):
+        self.sign_in()
+        sms = (await self.client.post("/api/v1/webhook/sms", json={"message": HDFC_UPI_DEBIT}, headers=HOOK)).json()["transaction"]
+        self.assertIsNone(sms["notes"])
+        url = f"/api/v1/transactions/{sms['id']}"
+
+        noted = (await self.client.patch(url, json={"notes": "  Team lunch, Rahul owes ₹150\n"}, headers=ORIGIN)).json()
+        self.assertEqual(noted["notes"], "Team lunch, Rahul owes ₹150")
+        self.assertEqual((noted["amount"], noted["merchant"], noted["category"]), (sms["amount"], sms["merchant"], sms["category"]))
+        self.assertGreater(noted["updated_at"], sms["updated_at"])  # polling picks it up on other devices
+        self.assertEqual((await self.client.get("/api/v1/transactions")).json()[0]["notes"], "Team lunch, Rahul owes ₹150")
+
+        # Editing something else keeps the note; sending "" (or only spaces) removes it
+        renamed = (await self.client.patch(url, json={"merchant": "Swiggy Instamart"}, headers=ORIGIN)).json()
+        self.assertEqual(renamed["notes"], "Team lunch, Rahul owes ₹150")
+        self.assertIsNone((await self.client.patch(url, json={"notes": "   "}, headers=ORIGIN)).json()["notes"])
+
+        self.assertEqual((await self.client.patch(url, json={"notes": "x" * 501}, headers=ORIGIN)).status_code, 422)
+        foreign = await self.client.patch(url, json={"notes": "hi"}, headers={"Origin": "https://attacker.example"})
+        self.assertEqual(foreign.status_code, 403)
+        mine = (await self.add()).json()
+        self.sign_in(self.other)
+        self.assertEqual((await self.client.patch(f"/api/v1/transactions/{mine['id']}", json={"notes": "hi"}, headers=ORIGIN)).status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

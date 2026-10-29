@@ -51,7 +51,7 @@ BANK_SMS = [
     ("Dear Customer, Acct XX310 is credited with Rs 750.00 on 20-Oct-26 from PRIYA SHARMA. UPI:629455556666-ICICI Bank.",
      "CREDIT", "750.00", None, "ICICI XX310", "629455556666", "Priya Sharma", "Uncategorized"),
     ("ICICI Bank Account XX310 credited:Rs. 90,000.00 on 30-Sep-26. Info NEFT-CITIN26000222-ACME TECH SALARY . Available Balance is Rs. 1,10,500.25.",
-     "CREDIT", "90000.00", "110500.25", "ICICI XX310", None, "Acme Tech Salary", "Salary & Income"),
+     "CREDIT", "90000.00", "110500.25", "ICICI XX310", None, "Acme Tech Salary", "Salary"),
     ("ICICI Bank Acc XX310 debited Rs. 10,000.00 on 11-Oct-26 InfoRTGS*ICICR000.Avl Bal Rs. 5,000.00.To dispute call 18002662 or SMS BLOCK 310 to 9215676766",
      "DEBIT", "10000.00", "5000.00", "ICICI XX310", None, None, "Transfer"),
     ("ICICI Bank Acct XX310 debited with INR 2,000.00 on 21-Oct-26 at ATM WDL MG ROAD. Avl Bal INR 3,000.00.",
@@ -115,9 +115,62 @@ class IgnoreTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(sms=sms[:60]):
                 self.assertEqual((await parse_sms(sms)).parsed_by, "ignored")
 
+    async def test_offers_are_ignored_without_asking_ai(self):
+        offers = [
+            # The two HDFC texts that were recorded as +Rs.50 refunds
+            "Welcome Bonus\nGet 10% cashback up to Rs.50 on your first load of min Rs.100 on HDFC Bank Digital Rupee app. Load: https://1.hdfc.bank.in/HDFCBK/s/AAy9mNlw T&C",
+            "Welcome Bonus\nGet 10% cashback up to Rs.50 on your first load of min Rs.100 on HDFC Bank Digital Rupee app. Load: https://1.hdfc.bank.in/HDFCBK/s/Ov15aw2x T&C",
+            "Get flat Rs.150 cashback on your first bill payment via HDFC Bank PayZapp. Use code PAY150. T&C apply",
+            "Shop on Amazon with your ICICI Bank Credit Card & earn up to 10% cashback. Offer valid till 31-Oct. T&C",
+            "Congratulations! You have won a cashback voucher worth Rs.100. Claim now: http://icici.co/x T&Cs apply",
+            "Enjoy 5% cashback on groceries this weekend with HDFC Bank Debit Card. Min txn Rs.500. Valid till Sunday",
+        ]
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), \
+                patch("parser.categorize_with_gemini", new_callable=AsyncMock) as ai, \
+                patch("parser.parse_sms_with_gemini", new_callable=AsyncMock) as full_ai:
+            for sms in offers:
+                with self.subTest(sms=sms[:60]):
+                    self.assertEqual((await parse_sms(sms)).parsed_by, "ignored")
+        ai.assert_not_called()
+        full_ai.assert_not_called()
+
+    async def test_real_cashback_still_counts(self):
+        for sms, amount in [
+            ("Cashback of Rs.50.00 has been credited to your HDFC Bank A/c XX4821 for your Digital Rupee load. Ref 629400001111", 50),
+            ("Rs 25.00 cashback received in your ICICI Bank Acct XX310 on 28-Oct-26. UPI Ref 629400002222", 25),
+            ("Congratulations! Rs.100 cashback credited to your HDFC Bank A/c XX4821 on 28-10-26 for the Welcome Bonus offer", 100),
+        ]:
+            with self.subTest(sms=sms[:60]):
+                p = await parse_sms(sms)
+                self.assertEqual((p.type, p.amount, p.category, p.is_parsed), ("CREDIT", Decimal(amount), "Refunds & Cashback", True))
+
     async def test_refund_of_failed_transaction_is_recorded(self):
         p = await parse_sms("Rs.500 credited to HDFC Bank A/c XX1234 as refund for failed UPI txn 629400001234")
         self.assertEqual((p.type, p.amount, p.category), ("CREDIT", Decimal(500), "Refunds & Cashback"))
+
+
+class SalaryAndIncomeTests(unittest.TestCase):
+    def test_salary_and_other_income_are_separate(self):
+        cases = [
+            ("Rs.92,500.00 credited to HDFC Bank A/c XX4821 on 31-10-26 towards SALARY for OCT-26 from ACME TECH PVT LTD", "Salary"),
+            ("ICICI Bank Acct XX310 credited with Rs 88,000.00 on 30-Oct-26; NEFT-SAL CR-ACME TECHNOLOGIES. Avl Bal Rs 1,02,000.00", "Salary"),
+            ("Rs.412.00 credited to HDFC Bank A/c XX4821 on 30-09-26 as Savings Interest. Avl bal Rs 50,412.00", "Income"),
+            ("Dividend of Rs 250.00 credited to ICICI Bank Acct XX310 on 12-Oct-26 from INFOSYS LTD", "Income"),
+        ]
+        for sms, category in cases:
+            with self.subTest(sms=sms[:50]):
+                p = parse_sms_with_regex(sms)
+                self.assertEqual((p.type, p.category), ("CREDIT", category))
+
+    def test_spending_that_mentions_interest_is_not_income(self):
+        p = parse_sms_with_regex("Rs.1,250.00 debited from HDFC Bank A/c XX4821 on 05-10-26 towards loan interest. Ref 629400003333")
+        self.assertEqual(p.type, "DEBIT")
+        self.assertNotIn(p.category, ("Income", "Salary"))
+
+    def test_old_combined_category_maps_to_salary(self):
+        self.assertEqual(normalize_category("Salary & Income"), "Salary")
+        self.assertIn("Income", CATEGORIES)
+        self.assertNotIn("Salary & Income", CATEGORIES)
 
 
 class CategoryFallbackTests(unittest.IsolatedAsyncioTestCase):

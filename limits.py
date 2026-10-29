@@ -37,7 +37,7 @@ MAX_ATTEMPTS = 3  # a failed email is retried on the next payments, up to this m
 MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
 ALL = "All"  # the overall limit, across every category
 # Limits apply to spending, so money-in categories (and Uncategorized) can't have one.
-LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary & Income", "Refunds & Cashback")]
+LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback")]
 
 
 def utc_now() -> datetime:

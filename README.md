@@ -75,6 +75,8 @@ Each SMS gets its category from, in order:
 3. **Your earlier payments** to the same merchant: the category of the latest categorised one.
 4. **Gemini**, waited on for at most 5 s so the Shortcut stays quick. If it's slower or failing, the SMS is saved Uncategorized and a background task retries with a 30 s limit (right away, then after 1 and 5 minutes) and fills the category in. An edit you make meanwhile always wins. Retries live in the server process, so a restart during those minutes drops them; the transaction just stays Uncategorized for you to set.
 
+**Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month. A debit that mentions interest is never income.
+
 `parsed_by` records where the category came from: `regex`, `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
 
 ## Bank balance
@@ -103,7 +105,8 @@ POST   /api/v1/transactions        {"type": "DEBIT", "amount": "249.50", "mercha
                                     "transaction_time": "2026-10-22T19:30:00+05:30",
                                     "category": null, "paid_with": "cash"}
 PATCH  /api/v1/transactions/{id}   any of: type, amount, merchant, category, transaction_time,
-                                    paid_with (hand-added entries only); only the fields sent change
+                                    paid_with (hand-added entries only), notes (up to 500
+                                    characters; "" removes it); only the fields sent change
 DELETE /api/v1/transactions/{id}   -> 204; any of your transactions, SMS or hand-added
 ```
 
@@ -115,7 +118,7 @@ Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending li
 
 **Clearing notifications:** `DELETE /api/v1/notifications/{id}` (swipe to delete) and `DELETE /api/v1/notifications` (Clear) hide notifications instead of deleting them (`notification_dismissals`, added by `create_all`). Each notification is also the record that its alert went out, so a cleared limit alert isn't sent again on the next payment, and the meter in Settings still says "notified".
 
-**Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary & Income, Refunds & Cashback) and Uncategorized can't have limits. With Gmail set up, a category alert also sends one email, best effort (not retried).
+**Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary, Income, Refunds & Cashback) and Uncategorized can't have limits. With Gmail set up, a category alert also sends one email, best effort (not retried).
 
 ```http
 GET /api/v1/limits   -> overall `weekly`/`monthly`, plus `categories`: [{category, weekly, monthly}]

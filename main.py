@@ -128,6 +128,7 @@ class TransactionResponse(BaseModel):
     raw_message: str
     is_parsed: bool
     parsed_by: str
+    notes: Optional[str]  # your own note, added after the transaction arrives
     transaction_time: datetime
     created_at: datetime
     updated_at: datetime  # moves on every edit; the dashboard polls by it
@@ -309,6 +310,7 @@ async def list_transactions(
 MANUAL = "manual"  # parsed_by for transactions added by hand
 EDITED = "edited"  # parsed_by for an SMS that needed review, completed by hand
 MAX_TRANSACTION_AMOUNT = Decimal("9999999999.99")  # Numeric(12, 2)
+MAX_NOTE_LENGTH = 500
 
 
 class _TransactionChecks(BaseModel):
@@ -323,6 +325,12 @@ class _TransactionChecks(BaseModel):
         if not value:
             raise ValueError("Enter who it was paid to or received from.")
         return value
+
+    @field_validator("notes", check_fields=False)
+    @classmethod
+    def _notes(cls, value: Optional[str]) -> Optional[str]:
+        # An empty note clears it (sent as "", since leaving a field out keeps it).
+        return None if value is None else value.strip()
 
     @field_validator("category", check_fields=False)
     @classmethod
@@ -363,6 +371,7 @@ class TransactionEdit(_TransactionChecks):
     category: Optional[str] = None
     transaction_time: Optional[AwareDatetime] = None
     paid_with: Optional[Literal["bank", "cash"]] = Field(default=None, description="Only for transactions added by hand")
+    notes: Optional[str] = Field(default=None, max_length=MAX_NOTE_LENGTH, description='Your own note; "" removes it')
 
 
 @app.post(
@@ -427,9 +436,9 @@ async def edit_transaction(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Change any detail of an SMS or a hand-added entry. A new category is remembered for the
-    merchant, so later SMS from it get the same one. Giving an SMS that needed review an amount
-    makes it count."""
+    """Change any detail of an SMS or a hand-added entry, or add your own note ("" removes it).
+    A new category is remembered for the merchant, so later SMS from it get the same one. Giving
+    an SMS that needed review an amount makes it count."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
@@ -440,6 +449,8 @@ async def edit_transaction(
         if txn.parsed_by != MANUAL:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only transactions you added by hand can switch between bank and cash.")
         txn.account_ref = CASH_ACCOUNT if changes.pop("paid_with") == "cash" else None
+    if "notes" in changes:
+        changes["notes"] = changes["notes"] or None
     for field, value in changes.items():
         setattr(txn, field, value)
     if not txn.is_parsed and txn.amount > 0:
@@ -449,7 +460,7 @@ async def edit_transaction(
     txn.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(txn)
-    if txn.is_parsed and txn.type == "DEBIT":
+    if txn.is_parsed and txn.type == "DEBIT" and changes.keys() - {"notes"}:
         background_tasks.add_task(check_spend_limits, txn.id)  # a bigger amount can cross a limit
     return TransactionResponse.model_validate(txn)
 

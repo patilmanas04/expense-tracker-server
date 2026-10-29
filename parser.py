@@ -25,7 +25,7 @@ UNCATEGORIZED = "Uncategorized"
 CATEGORIES = [
     "Food & Dining", "Groceries", "Shopping", "Travel & Commute", "Bills & Utilities",
     "Entertainment", "Investments & Finance", "Health & Fitness", "Education", "Insurance",
-    "EMI & Loans", "Credit Card Payment", "Cash Withdrawal", "Salary & Income",
+    "EMI & Loans", "Credit Card Payment", "Cash Withdrawal", "Salary", "Income",
     "Refunds & Cashback", "Transfer", UNCATEGORIZED,
 ]
 
@@ -124,7 +124,10 @@ CATEGORY_KEYWORDS = {
 # Order matters: earlier rules win.
 CONTEXT_RULES = [
     ("Cash Withdrawal", "DEBIT", r"(?<!/)\batm\b(?!\s*card)|\bwdl\b|\bwithdrawn\b|\bwithdrawal\b"),
-    ("Salary & Income", None, r"\bsalary\b|\bsal\b|\bpayroll\b|\binterest\b|\bint\.?\s*pd\b|\bdividend\b"),
+    # Salary is only monthly pay (the dashboard counts late-month pay toward the next month);
+    # other money in is Income. Spending that mentions interest is never either.
+    ("Salary", "CREDIT", r"\bsalary\b|\bsal\b|\bpayroll\b"),
+    ("Income", "CREDIT", r"\binterest\b|\bint\.?\s*pd\b|\bdividend\b"),
     ("Credit Card Payment", None, r"\b(?:credit\s*)?card(?:member)?\b.*\bpayment\b|\bpayment\b.*\bcard\b"),
     ("EMI & Loans", None, r"\bemi\b|\bloan\b|\bnach\b"),
     ("Insurance", None, r"\binsurance\b|\bpremium\b"),
@@ -143,6 +146,19 @@ IGNORE_RE = re.compile(
     re.IGNORECASE,
 )
 FAILED_RE = re.compile(r"\b(?:declined|failed|unsuccessful)\b", re.IGNORECASE)
+# Marketing texts from banks ("Get 10% cashback up to Rs.50 on your first load ... T&C"). They name
+# amounts and words like "cashback" but nothing has happened yet.
+PROMO_RE = re.compile(
+    r"\b(?:get|earn|enjoy|avail|win|won|grab|unlock)\b[^.\n]{0,40}?\b(?:cashback|discount|reward|voucher|bonus|offer)s?\b|"
+    r"\bup to (?:rs\.?|inr|₹)|\boffers?\b|\bwelcome bonus\b|\bt\s*&\s*c'?s?\b|\buse (?:promo )?code\b|"
+    r"\bvalid (?:till|until|up to)\b|\bmin(?:imum)?\.? (?:txn|transaction|load|spend|order|amount)\b|\bclaim now\b",
+    re.IGNORECASE,
+)
+# Wording that only appears once money has actually moved; it overrides PROMO_RE.
+COMPLETED_RE = re.compile(
+    r"\b(?:credited|debited|deducted|spent|sent|received|paid|withdrawn|transferred|refunded|reversed)\b",
+    re.IGNORECASE,
+)
 REVERSAL_RE = re.compile(r"\b(?:refund(?:ed)?|reversed|reversal|credited back)\b", re.IGNORECASE)
 
 # Direction keywords used by HDFC/ICICI (and most Indian banks). The earliest match wins, so
@@ -154,7 +170,8 @@ DEBIT_RE = re.compile(
     re.IGNORECASE,
 )
 CREDIT_RE = re.compile(
-    r"\b(?:credited|credit alert|deposited|received|refund(?:ed)?|reversed|reversal|cashback|added to)\b",
+    # Not "cashback" on its own: offers use it too. A real one says credited/received.
+    r"\b(?:credited|credit alert|deposited|received|refund(?:ed)?|reversed|reversal|added to)\b",
     re.IGNORECASE,
 )
 
@@ -212,11 +229,16 @@ def compute_message_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+# Names used before Salary and Income were split (Gemini or old records may still send them).
+_RENAMED_CATEGORIES = {"salary & income": "Salary"}
+
+
 def normalize_category(category: Optional[str]) -> str:
     """Maps any category label onto the supported list, defaulting to Uncategorized."""
     if not category:
         return UNCATEGORIZED
     wanted = category.strip().casefold()
+    wanted = _RENAMED_CATEGORIES.get(wanted, wanted).casefold()
     return next((c for c in CATEGORIES if c.casefold() == wanted), UNCATEGORIZED)
 
 
@@ -475,7 +497,7 @@ Instructions:
 3. amount: the transaction amount (positive). Never the balance, limit or amount due.
 4. currency: 3-letter currency code, e.g. "INR" or "USD".
 5. merchant: clean merchant, person or service name ("Swiggy", "Amazon", "Rahul Sharma"), else null.
-6. category: exactly one of {CATEGORIES}. Person-to-person and own-account transfers are "Transfer".
+6. category: exactly one of {CATEGORIES}. Person-to-person and own-account transfers are "Transfer". "Salary" is only regular pay from an employer; any other money received is "Income".
    Use "{UNCATEGORIZED}" if unsure.
 7. account_ref: last digits of the card/account (e.g. "XX1234"), or null.
 8. balance: available balance or credit limit after the transaction if mentioned, else null.
@@ -524,6 +546,7 @@ SMS:
 \"\"\"{sms_text}\"\"\"
 
 Reply with category exactly one of {CATEGORIES}.
+"Salary" is only regular pay from an employer; any other money received is "Income".
 Person-to-person and own-account transfers are "Transfer". Use "{UNCATEGORIZED}" if you are not reasonably sure.
 """
     result: _AICategory = await _ask_gemini(prompt, _AICategory, timeout=timeout)
@@ -535,8 +558,10 @@ def _ignored() -> ParsedTransaction:
 
 
 def is_non_transaction(sms_text: str) -> bool:
-    """OTPs, failed payments, payment requests and future debits are not completed transactions."""
+    """OTPs, failed payments, payment requests, future debits and offers are not completed transactions."""
     if IGNORE_RE.search(sms_text):
+        return True
+    if PROMO_RE.search(sms_text) and not COMPLETED_RE.search(sms_text):
         return True
     # "Refund for failed txn credited" is real money in; a bare "txn failed" is not.
     return bool(FAILED_RE.search(sms_text)) and not REVERSAL_RE.search(sms_text)
