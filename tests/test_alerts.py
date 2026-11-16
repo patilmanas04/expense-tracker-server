@@ -385,7 +385,7 @@ class LimitsApiTests(GoogleTestCase):
         [note] = inbox["items"]
         self.assertEqual(note["title"], "Weekly Food & Dining limit crossed")
         self.assertIn("₹450.00 of ₹400.00 on Food & Dining this week", note["body"])
-        self.assertEqual(note["link"], "/settings#limits")
+        self.assertEqual(note["link"], "/settings/limits")
         [mail] = self.google.sent  # an email too, when Gmail is set up
         self.assertIn("Weekly Food & Dining limit crossed", mail["Subject"])
         await self.debit("10.00", merchant="SWIGGY")

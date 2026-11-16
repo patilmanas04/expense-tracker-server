@@ -425,7 +425,7 @@ async def _notify_once(db: AsyncSession, user: User, period: str, start: date, e
         title=f"{_limit_name(period, category)} {state}",
         body=(f"{format_money(spent, currency)} of {format_money(limit, currency)}{on} this {noun} "
               f"({_window_text(start, end)}) · {int(spent * 100 / limit)}%"),
-        link="/settings#limits",
+        link="/settings/limits",
         dedupe_key=_notification_key(period, start, limit, category),
     )
 
