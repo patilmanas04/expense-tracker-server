@@ -1,13 +1,17 @@
-"""Weekly and monthly spend limits, overall ("All") and per category. The first time each is
-reached, an in-app notification is created (bell on Home), plus a Gmail alert if GMAIL_* keys
-are configured (optional; retried for overall limits, best effort for category limits).
+"""Weekly and monthly spend limits: overall ("All"), per category and per merchant. The first time
+each is reached, an in-app notification is created (bell on Home), plus a Gmail alert if GMAIL_*
+keys are configured (optional; retried for overall limits, best effort for category and merchant
+limits).
 
 "Spent" matches the dashboard: parsed debits in the limit's currency, card spends included.
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
+Which payments a merchant limit counts is decided in merchants.py.
 """
 import html
 import logging
+import unicodedata
 import uuid
+from collections.abc import Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from dataclasses import dataclass
 from decimal import Decimal
@@ -15,16 +19,18 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import String, delete, exists, func, literal, select, union_all, update
+from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy import String, delete, exists, func, literal, or_, select, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import mailer
+import merchants
 from auth import FRONTEND_URL, OWNER_EMAIL, current_user, same_origin
 from dashboard import ownership
 from database import AsyncSessionLocal, get_db
-from models import CategoryLimit, Notification, SpendAlert, SpendLimit, Transaction, User
+from models import (CategoryLimit, KnownMerchant, MerchantCategory, MerchantLimit, Notification, SpendAlert,
+                    SpendLimit, Transaction, User)
 from notifications import create_once
 from parser import CATEGORIES, UNCATEGORIZED
 
@@ -35,6 +41,8 @@ IST = ZoneInfo("Asia/Kolkata")
 PERIODS = ("weekly", "monthly")
 MAX_ATTEMPTS = 3  # a failed email is retried on the next payments, up to this many tries
 MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
+MAX_MERCHANT_LENGTH = 255  # String(255)
+LABEL_LENGTH = 120  # a merchant's name in a notification title, which holds 200 characters
 ALL = "All"  # the overall limit, across every category
 # Limits apply to spending, so money-in categories (and Uncategorized) can't have one.
 LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback")]
@@ -117,6 +125,64 @@ def _notification_key(period: str, start: date, limit: Decimal, category: Option
     return f"spend_limit:{scope}{period}:{start.isoformat()}:{Decimal(limit):.2f}"
 
 
+def _merchant_notification_key(limit_id: uuid.UUID, period: str, start: date, limit: Decimal) -> str:
+    # The limit's id, not its name, keeps "Swiggy" and "SWIGGY" apart under any collation.
+    return f"spend_limit:merchant:{limit_id}:{period}:{start.isoformat()}:{Decimal(limit):.2f}"
+
+
+def merchant_debits(user: User, currency: str, since: Optional[datetime] = None):
+    """(merchant, amount, time) of every payment a merchant limit can count. The summary, the
+    alert check, known merchants and the preview all read through this, so they always agree."""
+    query = select(Transaction.merchant, Transaction.amount, Transaction.transaction_time).where(
+        ownership(user),
+        Transaction.is_parsed.is_(True),
+        Transaction.type == "DEBIT",
+        Transaction.currency == currency,
+    )
+    return query if since is None else query.where(Transaction.transaction_time >= since)
+
+
+async def _merchant_rows(db: AsyncSession, user: User, currency: str,
+                         since: Optional[datetime] = None) -> list[tuple[Optional[str], Decimal, datetime]]:
+    rows = (await db.execute(merchant_debits(user, currency, since))).all()
+    return [(merchant, amount, _utc(when)) for merchant, amount, when in rows]
+
+
+async def load_merchant_limits(db: AsyncSession, user_id: uuid.UUID) -> list[MerchantLimit]:
+    """Your merchant limits, oldest first (the order they're listed in)."""
+    return list(await db.scalars(
+        select(MerchantLimit).where(MerchantLimit.user_id == user_id).order_by(MerchantLimit.created_at, MerchantLimit.id)
+    ))
+
+
+def _like_words(name: str) -> str:
+    """A LIKE pattern (escaped with "/") for any text holding the cleaned name's words in order,
+    with anything between them: "Amazon Pay" finds a stored "Amazon  Pay" too."""
+    escaped = (word.replace("/", "//").replace("%", "/%").replace("_", "/_") for word in name.split(" "))
+    return "%" + "%".join(escaped) + "%"
+
+
+async def _is_known(db: AsyncSession, user: User, name: str) -> bool:
+    """Whether you've paid a merchant with this cleaned name, typed it before, or have a limit on
+    it. `name` must be cleaned. The SQL only narrows the rows (a name that's the same once cleaned
+    always passes it, on any database); the exact, case-sensitive comparison of cleaned names
+    happens here, so no collation can change the answer."""
+    # Stored names aren't normalised (hand-entered or AI-read ones can hold decomposed accents), so
+    # the NFD spelling of the name is looked for too.
+    patterns = [func.lower(_like_words(form)) for form in {name, unicodedata.normalize("NFD", name)}]
+
+    def narrowed(column):
+        return or_(*(func.lower(column).like(pattern, escape="/") for pattern in patterns))
+
+    paid = merchant_debits(user, "INR").with_only_columns(Transaction.merchant.label("name")).where(narrowed(Transaction.merchant))
+    typed = select(KnownMerchant.name.label("name")).where(KnownMerchant.user_id == user.id, narrowed(KnownMerchant.name))
+    limited = select(MerchantLimit.merchant.label("name")).where(
+        MerchantLimit.user_id == user.id, MerchantLimit.merchant_hash == merchants.name_hash(name)
+    )
+    found = (await db.scalars(union_all(paid, typed, limited))).all()
+    return name in {merchants.clean(found_name) for found_name in found if found_name}
+
+
 @dataclass(frozen=True)
 class Rule:
     """A limit you've set: overall (category "All") or for one category."""
@@ -160,10 +226,23 @@ def _limit_field():
     return Field(default=None, gt=0, le=MAX_AMOUNT, max_digits=14, decimal_places=2)
 
 
+def _encodable(data):
+    """A 422 echoes the values it rejects, and a lone surrogate can't be encoded in the response;
+    so invalid characters in any text field become U+FFFD (itself invalid) before validation."""
+    if not isinstance(data, dict):
+        return data
+    return {key: merchants.mark_invalid_characters(value) if isinstance(value, str) else value for key, value in data.items()}
+
+
 class LimitsInput(BaseModel):
     category: Optional[str] = Field(default=None, description='A spending category; omit or "All" for overall spending')
     weekly_limit: Optional[Decimal] = _limit_field()  # null = no limit
     monthly_limit: Optional[Decimal] = _limit_field()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mark_invalid_characters(cls, data):
+        return _encodable(data)
 
     @field_validator("category")
     @classmethod
@@ -174,6 +253,43 @@ class LimitsInput(BaseModel):
         match = next((c for c in LIMIT_CATEGORIES if c.casefold() == wanted), None)
         if match is None:
             raise ValueError("Pick a spending category, or All.")
+        return match
+
+
+class MerchantLimitInput(BaseModel):
+    id: Optional[uuid.UUID] = Field(default=None, description="The limit being changed or removed, when editing one")
+    merchant: str = Field(description="Exactly as picked or typed; case matters")
+    weekly_limit: Optional[Decimal] = _limit_field()  # both null = remove the limit
+    monthly_limit: Optional[Decimal] = _limit_field()
+    category: Optional[str] = Field(default=None, description="Only for a merchant you haven't paid or typed before")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mark_invalid_characters(cls, data):
+        return _encodable(data)  # `_merchant` then rejects them
+
+    @field_validator("merchant")
+    @classmethod
+    def _merchant(cls, value: str) -> str:
+        if merchants.has_invalid_characters(value):
+            raise ValueError("Merchant names can't contain invalid characters.")
+        value = merchants.clean(value)
+        if not merchants.words(value):
+            raise ValueError("Enter a merchant name.")
+        if len(value) > MAX_MERCHANT_LENGTH:
+            raise ValueError(f"Merchant names can be up to {MAX_MERCHANT_LENGTH} characters.")
+        return value
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, value: Optional[str]) -> Optional[str]:
+        wanted = (value or "").strip().casefold()
+        if not wanted:
+            return None
+        # Spending categories only: Uncategorized would make merchant memory forget the merchant.
+        match = next((c for c in LIMIT_CATEGORIES if c.casefold() == wanted), None)
+        if match is None:
+            raise ValueError("Pick a spending category.")
         return match
 
 
@@ -197,17 +313,38 @@ class CategoryStatus(BaseModel):
     monthly: PeriodStatus
 
 
+class MerchantLimitStatus(BaseModel):
+    id: uuid.UUID
+    merchant: str
+    counts: list[str]  # names this limit counts, all time, most payments first; [] before any payment
+    weekly: PeriodStatus
+    monthly: PeriodStatus
+
+
 class LimitsSummary(BaseModel):
     currency: str
     weekly: PeriodStatus  # overall
     monthly: PeriodStatus
     categories: list[CategoryStatus] = []  # only categories with a limit
+    merchants: list[MerchantLimitStatus] = []  # oldest first
     email: EmailStatus
 
 
-async def summarize(db: AsyncSession, user: User, rules: list[Rule]) -> LimitsSummary:
+class KnownMerchantOut(BaseModel):
+    name: str
+    payments: int  # 0 for a merchant you typed but haven't paid
+
+
+class MerchantPreview(BaseModel):
+    known: bool  # False: the sheet asks for the new merchant's category
+    counts: list[str]
+
+
+async def summarize(db: AsyncSession, user: User, rules: list[Rule],
+                    merchant_limits: Sequence[MerchantLimit] = ()) -> LimitsSummary:
     """Every meter, overall and per category, in a single query: the database may be a continent
-    away, so each round trip costs far more than the work itself."""
+    away, so each round trip costs far more than the work itself. Merchant limits add their
+    "notified" flags to that query and one read of your debits, matched here in Python."""
     now = utc_now()
     overall = next((rule for rule in rules if rule.category == ALL), None)
     per_category = [rule for rule in rules if rule.category != ALL]
@@ -236,21 +373,42 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule]) -> LimitsSu
                 columns.append(select(SpendAlert.error).where(
                     *_alert_key(user.id, period, start_date, limit), SpendAlert.status == "failed",
                 ).scalar_subquery().label(f"{prefix}_{period}_error"))
+    for i, rule in enumerate(merchant_limits):
+        for period, limit in amounts(rule).items():
+            if limit:
+                columns.append(exists().where(
+                    Notification.user_id == user.id,
+                    Notification.dedupe_key == _merchant_notification_key(rule.id, period, windows[period][0], limit),
+                ).label(f"m{i}_{period}_alerted"))
     row = (await db.execute(select(*columns))).one()._mapping
 
+    def period_status(period: str, limit: Optional[Decimal], spent, alerted) -> PeriodStatus:
+        start_date, _, end = windows[period]
+        return PeriodStatus(
+            limit=float(limit) if limit else None,
+            spent=float(_money(spent)),
+            start=start_date,
+            end=_last_day(end),
+            alerted=bool(limit) and bool(alerted),
+        )
+
     def statuses(prefix: str, limits: dict[str, Optional[Decimal]]) -> dict[str, PeriodStatus]:
-        out = {}
-        for period in PERIODS:
-            start_date, _, end = windows[period]
-            limit = limits[period]
-            out[period] = PeriodStatus(
-                limit=float(limit) if limit else None,
-                spent=float(_money(row[f"{prefix}_{period}_spent"])),
-                start=start_date,
-                end=_last_day(end),
-                alerted=bool(limit) and bool(row[f"{prefix}_{period}_alerted"]),
-            )
-        return out
+        return {period: period_status(period, limits[period], row[f"{prefix}_{period}_spent"],
+                                      limits[period] and row[f"{prefix}_{period}_alerted"])
+                for period in PERIODS}
+
+    merchant_statuses = []
+    if merchant_limits:
+        rows = await _merchant_rows(db, user, "INR")
+        spans = {period: windows[period][1:] for period in PERIODS}
+        for i, rule in enumerate(merchant_limits):
+            limits = amounts(rule)
+            weekly, monthly, counts = merchants.meter(rule.merchant, rows, spans)
+            status = {period: period_status(period, limits[period], spent, limits[period] and row[f"m{i}_{period}_alerted"])
+                      for period, spent in (("weekly", weekly), ("monthly", monthly))}
+            merchant_statuses.append(MerchantLimitStatus(
+                id=rule.id, merchant=rule.merchant, counts=counts, weekly=status["weekly"], monthly=status["monthly"],
+            ))
 
     overall_limits = meters[0][3]
     # The monthly failure wins over the weekly one, as before.
@@ -266,13 +424,20 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule]) -> LimitsSu
         weekly=overall_status["weekly"],
         monthly=overall_status["monthly"],
         categories=categories,
+        merchants=merchant_statuses,
         email=EmailStatus(configured=mailer.configured(), to=mailer.recipient() or None, last_error=last_error),
     )
 
 
+async def _summary(db: AsyncSession, user: User) -> LimitsSummary:
+    # Merchant limits are loaded before the meters, so their "notified" keys can join that query.
+    rules = await load_rules(db, user.id)
+    return await summarize(db, user, rules, await load_merchant_limits(db, user.id))
+
+
 @router.get("", response_model=LimitsSummary)
 async def get_limits(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    return await summarize(db, user, await load_rules(db, user.id))
+    return await _summary(db, user)
 
 
 @router.put("", response_model=LimitsSummary, dependencies=[Depends(same_origin)])
@@ -283,7 +448,7 @@ async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: 
     if category and body.weekly_limit is None and body.monthly_limit is None:
         await db.execute(delete(CategoryLimit).where(CategoryLimit.user_id == user.id, CategoryLimit.category == category))
         await db.commit()
-        return await summarize(db, user, await load_rules(db, user.id))
+        return await _summary(db, user)
 
     async def save() -> None:
         if category:
@@ -306,7 +471,92 @@ async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: 
     except IntegrityError:
         await db.rollback()  # two saves raced to create the row; update the winner
         await save()
-    return await summarize(db, user, await load_rules(db, user.id))
+    return await _summary(db, user)
+
+
+@router.put("/merchants", response_model=LimitsSummary, dependencies=[Depends(same_origin)])
+async def set_merchant_limit(body: MerchantLimitInput, user: User = Depends(current_user),
+                             db: AsyncSession = Depends(get_db)):
+    """Sets the limit for one merchant name, exactly as given. Leaving both amounts empty removes
+    it. A merchant you've never paid or typed needs a `category`: the name becomes a known
+    merchant, and its category goes into merchant memory unless memory already has one for it."""
+    # categorize imports this module at its top, so a top-level import here would fail for any
+    # process that imports limits first.
+    import categorize
+
+    name, key = body.merchant, merchants.name_hash(body.merchant)
+    clear = body.weekly_limit is None and body.monthly_limit is None
+
+    async def save() -> None:
+        if body.id is not None:
+            # Editing a limit: if another device deleted it meanwhile, say so rather than re-create it.
+            rule = await db.scalar(select(MerchantLimit).where(MerchantLimit.user_id == user.id, MerchantLimit.id == body.id))
+            if rule is None:
+                if clear:
+                    return  # already gone
+                raise HTTPException(404, "This limit was deleted.")
+        else:
+            rule = await db.scalar(select(MerchantLimit).where(MerchantLimit.user_id == user.id, MerchantLimit.merchant_hash == key))
+        if rule is not None:
+            # No "known" check: the name may no longer appear in any payment.
+            if clear:
+                await db.delete(rule)
+            else:
+                rule.weekly_limit, rule.monthly_limit, rule.updated_at = body.weekly_limit, body.monthly_limit, utc_now()
+            await db.commit()
+            return
+        if clear:
+            return  # nothing to remove
+        if not await _is_known(db, user, name):
+            if body.category is None:
+                raise HTTPException(422, "Pick a category for this new merchant.")
+            db.add(KnownMerchant(user_id=user.id, name=name, name_hash=key))
+            # Memory ignores case, so a typed "swiggy" mustn't change the category "Swiggy" already has.
+            remembered = await db.scalar(select(MerchantCategory.id).where(
+                MerchantCategory.user_id == user.id,
+                MerchantCategory.merchant_key == categorize.merchant_key(name),
+                MerchantCategory.type == "DEBIT",
+            ))
+            if remembered is None:
+                await categorize.remember(db, user.id, name, "DEBIT", body.category)
+        db.add(MerchantLimit(user_id=user.id, merchant=name, merchant_hash=key, currency="INR",
+                             weekly_limit=body.weekly_limit, monthly_limit=body.monthly_limit))
+        await db.commit()
+
+    try:
+        await save()
+    except IntegrityError:
+        await db.rollback()  # two saves raced to create the limit; this run updates the winner
+        await save()
+    return await _summary(db, user)
+
+
+@router.get("/merchants/known", response_model=list[KnownMerchantOut])
+async def list_known_merchants(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    """Merchants to pick from: every name you've paid ("Swiggy" and "SWIGGY" are two) and every one
+    you typed, most payments first. Names are made distinct here, not in SQL, so case is kept on
+    every database."""
+    paid = merchant_debits(user, "INR").with_only_columns(Transaction.merchant.label("name"), literal(1).label("paid"))
+    typed = select(KnownMerchant.name.label("name"), literal(0).label("paid")).where(KnownMerchant.user_id == user.id)
+    rows = (await db.execute(union_all(paid, typed))).all()
+    names = merchants.known_names([row for row in rows if row.paid], [row.name for row in rows if not row.paid])
+    return [KnownMerchantOut(name=name, payments=payments) for name, payments in names]
+
+
+@router.get("/merchants/preview", response_model=MerchantPreview)
+async def preview_merchant(merchant: str = "", user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    """For the limit sheet as you type: whether the name is known (if not, the sheet asks for its
+    category) and the names a limit on it would count. Never an error; a name that can't have a
+    limit just gives nothing."""
+    if merchants.has_invalid_characters(merchant):
+        return MerchantPreview(known=False, counts=[])
+    name = merchants.clean(merchant)
+    if not merchants.words(name) or len(name) > MAX_MERCHANT_LENGTH:
+        return MerchantPreview(known=False, counts=[])
+    known = await _is_known(db, user, name)
+    spans = {period: period_window(period, utc_now())[1:] for period in PERIODS}
+    _, _, counts = merchants.meter(name, await _merchant_rows(db, user, "INR"), spans)
+    return MerchantPreview(known=known, counts=counts)
 
 
 @router.post("/test-email", dependencies=[Depends(same_origin)])
@@ -340,17 +590,26 @@ def _html_email(heading: str, body: str) -> str:
     )
 
 
-def _limit_name(period: str, category: Optional[str]) -> str:
-    """ "Weekly spend limit" overall, "Weekly Food & Dining limit" for a category."""
+def _limit_name(period: str, scope: Optional[str]) -> str:
+    """ "Weekly spend limit" overall, "Weekly Food & Dining limit" for a category, "Weekly Swiggy
+    limit" for a merchant."""
     label = "Weekly" if period == "weekly" else "Monthly"
-    return f"{label} {category or 'spend'} limit"
+    return f"{label} {scope or 'spend'} limit"
+
+
+def _short_label(name: str) -> str:
+    # Notification titles hold 200 characters and a merchant name can have 255; the body keeps it whole.
+    return name if len(name) <= LABEL_LENGTH else name[:LABEL_LENGTH - 1] + "…"
 
 
 def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_utc: datetime,
-                  txn: Transaction, currency: str, category: Optional[str] = None) -> tuple[str, str, str]:
-    """Subject, plain text and HTML for a limit alert."""
-    name = _limit_name(period, category)
-    on = f" on {category}" if category else ""
+                  txn: Transaction, currency: str, category: Optional[str] = None, *,
+                  label: Optional[str] = None) -> tuple[str, str, str]:
+    """Subject, plain text and HTML for a limit alert. `label` is a merchant limit's full name."""
+    name = _limit_name(period, label or category)
+    on = f" at {label}" if label else f" on {category}" if category else ""
+    # A merchant's name keeps its case ("Swiggy" and "SWIGGY" are different limits).
+    of_limit = f"{period} {label} limit" if label else name.lower()
     noun = "week" if period == "weekly" else "month"
     state = "reached" if spent == limit else "crossed"
     percent = int(spent * 100 / limit)
@@ -364,14 +623,14 @@ def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_
 
     subject = f"{name} {state}: {spent_text} of {limit_text}"
     text = (
-        f"You've spent {spent_text}{on} this {noun} ({window}), {percent}% of your {limit_text} {name.lower()}.\n\n"
+        f"You've spent {spent_text}{on} this {noun} ({window}), {percent}% of your {limit_text} {of_limit}.\n\n"
         f"Latest payment: {latest}.\n\n"
         f"Open Folio: {FRONTEND_URL}\n\n"
         f"You get one email per limit each {noun}. Change limits in Folio → Settings.\n"
     )
     body = (
         f"<p>You've spent <strong>{spent_text}</strong>{html.escape(on)} this {noun} ({window}), "
-        f"<strong>{percent}%</strong> of your {limit_text} {html.escape(name.lower())}.</p>"
+        f"<strong>{percent}%</strong> of your {limit_text} {html.escape(of_limit)}.</p>"
         f"<p style='color:#6e6e78'>Latest payment: {html.escape(latest)}.</p>"
         f"<p style='color:#6e6e78;font-size:13px'>You get one email per limit each {noun}. Change limits in Folio → Settings.</p>"
     )
@@ -414,19 +673,21 @@ async def _alert_once(db: AsyncSession, user: User, period: str, start: date, en
 
 
 async def _notify_once(db: AsyncSession, user: User, period: str, start: date, end: datetime,
-                       limit: Decimal, spent: Decimal, currency: str, category: Optional[str] = None) -> bool:
-    """True if the notification is new (it's only ever created once per limit and period)."""
+                       limit: Decimal, spent: Decimal, currency: str, category: Optional[str] = None, *,
+                       label: Optional[str] = None, dedupe_key: Optional[str] = None) -> bool:
+    """True if the notification is new (it's only ever created once per limit and period).
+    `label` is a merchant limit's full name; it's shortened in the title only."""
     noun = "week" if period == "weekly" else "month"
     state = "reached" if spent == limit else "crossed"
-    on = f" on {category}" if category else ""
+    on = f" at {label}" if label else f" on {category}" if category else ""
     return await create_once(
         db, user.id,
         kind="spend_limit",
-        title=f"{_limit_name(period, category)} {state}",
+        title=f"{_limit_name(period, _short_label(label) if label else category)} {state}",
         body=(f"{format_money(spent, currency)} of {format_money(limit, currency)}{on} this {noun} "
               f"({_window_text(start, end)}) · {int(spent * 100 / limit)}%"),
-        link="/settings#limits",
-        dedupe_key=_notification_key(period, start, limit, category),
+        link="/settings/limits",
+        dedupe_key=dedupe_key or _notification_key(period, start, limit, category),
     )
 
 
@@ -439,24 +700,35 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
     owner = await db.scalar(select(User).where(User.email == OWNER_EMAIL))
     if owner is None or txn.user_id not in (None, owner.id):
         return
+    # When create_once loses a race to a simultaneous SMS it rolls back, which expires every object
+    # in the session, and reading an expired one fails under asyncio (no lazy loads). From here on
+    # these two are only read, so they're detached; limits are read into plain values.
+    db.expunge(txn)
+    db.expunge(owner)
     now, when = utc_now(), _utc(txn.transaction_time)
     setting = await _setting(db, owner.id)
     if setting is not None and txn.currency == setting.currency:
+        currency = setting.currency
+        limits = {period: getattr(setting, f"{period}_limit") for period in PERIODS}
         for period in PERIODS:
-            limit = getattr(setting, f"{period}_limit")
+            limit = limits[period]
             if limit is None:
                 continue
             start_date, start, end = period_window(period, now)
             if not start <= when < end:
                 continue  # a late SMS for a past week/month doesn't alert
-            spent = await spent_between(db, owner, setting.currency, start, end)
+            spent = await spent_between(db, owner, currency, start, end)
             if spent < limit:
                 continue
-            await _notify_once(db, owner, period, start_date, end, limit, spent, setting.currency)
+            await _notify_once(db, owner, period, start_date, end, limit, spent, currency)
             # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
             if mailer.configured():
-                await _alert_once(db, owner, period, start_date, end, limit, spent, txn, setting.currency)
+                await _alert_once(db, owner, period, start_date, end, limit, spent, txn, currency)
     await _check_category(db, owner, txn, now, when)
+    try:  # last and on its own, so a failure here can't stop the overall and category alerts
+        await _check_merchants(db, owner, txn, now, when)
+    except Exception:
+        logger.exception("Merchant limit check failed")
 
 
 async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
@@ -466,22 +738,59 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
     rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category))
     if rule is None or rule.currency != txn.currency:
         return
+    # Plain values, as in _check: a lost notification race rolls back and expires the row.
+    category, currency = rule.category, rule.currency
+    limits = {period: getattr(rule, f"{period}_limit") for period in PERIODS}
     for period in PERIODS:
-        limit = getattr(rule, f"{period}_limit")
+        limit = limits[period]
         if limit is None:
             continue
         start_date, start, end = period_window(period, now)
         if not start <= when < end:
             continue
-        spent = await spent_between(db, owner, rule.currency, start, end, rule.category)
+        spent = await spent_between(db, owner, currency, start, end, category)
         if spent < limit:
             continue
-        if await _notify_once(db, owner, period, start_date, end, limit, spent, rule.currency, rule.category) and mailer.configured():
+        if await _notify_once(db, owner, period, start_date, end, limit, spent, currency, category) and mailer.configured():
             try:
-                subject, text, body = compose_alert(period, limit, spent, start_date, end, txn, rule.currency, rule.category)
+                subject, text, body = compose_alert(period, limit, spent, start_date, end, txn, currency, category)
                 await mailer.send_email(mailer.recipient(), subject, text, body)
             except Exception as error:  # noqa: BLE001 - the notification already went out
                 logger.warning("Category limit email failed: %s", error)
+
+
+async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
+    """Every merchant limit whose name matches this transaction's merchant: a notification each,
+    plus one best-effort email, as for category limits."""
+    if txn.currency != "INR":
+        return  # merchant limits are in rupees
+    # Plain values, as in _check: a lost notification race rolls back and expires the rows.
+    rules = [(rule.id, rule.merchant, rule.currency, rule.weekly_limit, rule.monthly_limit)
+             for rule in await load_merchant_limits(db, owner.id) if merchants.matches(rule.merchant, txn.merchant)]
+    if not rules:
+        return
+    windows = {period: period_window(period, now) for period in PERIODS}
+    since = min(start for _, start, _ in windows.values())
+    rows = await _merchant_rows(db, owner, "INR", since)
+    spans = {period: windows[period][1:] for period in PERIODS}
+    for rule_id, merchant, currency, weekly_limit, monthly_limit in rules:
+        weekly, monthly, _ = merchants.meter(merchant, rows, spans)
+        for period, spent, limit in (("weekly", weekly, weekly_limit), ("monthly", monthly, monthly_limit)):
+            if limit is None:
+                continue
+            start_date, start, end = windows[period]
+            if not start <= when < end:
+                continue  # a late SMS for a past week/month doesn't alert
+            if spent < limit:
+                continue
+            created = await _notify_once(db, owner, period, start_date, end, limit, spent, currency, label=merchant,
+                                         dedupe_key=_merchant_notification_key(rule_id, period, start_date, limit))
+            if created and mailer.configured():
+                try:
+                    subject, text, body = compose_alert(period, limit, spent, start_date, end, txn, currency, label=merchant)
+                    await mailer.send_email(mailer.recipient(), subject, text, body)
+                except Exception as error:  # noqa: BLE001 - the notification already went out
+                    logger.warning("Merchant limit email failed: %s", error)
 
 
 async def check_spend_limits(transaction_id: uuid.UUID) -> None:

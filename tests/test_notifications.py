@@ -69,7 +69,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(inbox["unread"], 1)
         [item] = inbox["items"]
         self.assertEqual((item["kind"], item["title"], item["link"], item["read"]),
-                         ("spend_limit", "Weekly spend limit crossed", "/settings#limits", False))
+                         ("spend_limit", "Weekly spend limit crossed", "/settings/limits", False))
         for expected in ["₹550.00", "₹500.00", "110%", "19 Oct", "25 Oct"]:
             self.assertIn(expected, item["body"])
         await self.debit("100.00")  # already notified this week
@@ -120,7 +120,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_notifications_are_private_and_writes_need_same_origin(self):
         async with AsyncSessionLocal() as db:
             db.add(Notification(user_id=self.other.id, kind="spend_limit", title="Someone else's", body="x",
-                                link="/settings#limits", dedupe_key="other", created_at=NOW))
+                                link="/settings/limits", dedupe_key="other", created_at=NOW))
             await db.commit()
             theirs = (await db.scalar(select(Notification))).id
         self.assertEqual(await self.inbox(), {"unread": 0, "items": []})
@@ -163,7 +163,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_clearing_is_private_and_needs_same_origin(self):
         async with AsyncSessionLocal() as db:
             db.add(Notification(user_id=self.other.id, kind="spend_limit", title="Someone else's", body="x",
-                                link="/settings#limits", dedupe_key="other", created_at=NOW))
+                                link="/settings/limits", dedupe_key="other", created_at=NOW))
             await db.commit()
             theirs = (await db.scalar(select(Notification))).id
         self.assertEqual((await self.client.delete(f"/api/v1/notifications/{theirs}", headers=ORIGIN)).status_code, 404)

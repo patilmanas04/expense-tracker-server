@@ -507,3 +507,97 @@ class NotificationDismissal(Base):
         nullable=False,
     )
 
+
+
+class MerchantLimit(Base):
+    """Weekly/monthly spending limit for one merchant name, exactly as picked or typed (merchants.py
+    decides which payments it counts)."""
+
+    __tablename__ = "merchant_limits"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    merchant: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # case kept: "Swiggy" and "SWIGGY" are different limits
+    merchant_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )  # SHA-256 of `merchant` (merchants.name_hash)
+    weekly_limit: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(14, 2),
+        nullable=True,
+    )  # None = no limit
+    monthly_limit: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(14, 2),
+        nullable=True,
+    )
+    currency: Mapped[str] = mapped_column(
+        String(10),
+        default="INR",
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )  # list order
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # Unique on the hash, not the name: under a case-insensitive collation (MySQL's default) the
+    # name itself would make "Swiggy" and "SWIGGY" collide, but their hashes always differ.
+    __table_args__ = (
+        UniqueConstraint("user_id", "merchant_hash", name="uq_merchant_limit"),
+    )
+
+
+class KnownMerchant(Base):
+    """A merchant you typed when adding a limit, spelled exactly as typed. Merchants you've paid
+    are known from their payments; this keeps typed ones known (with their case, which merchant
+    memory doesn't keep) even after their limit is deleted."""
+
+    __tablename__ = "known_merchants"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    name_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )  # SHA-256 of `name` (merchants.name_hash)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # As for MerchantLimit: the hash keeps names that differ only in case apart on every database.
+    __table_args__ = (
+        UniqueConstraint("user_id", "name_hash", name="uq_known_merchant"),
+    )
