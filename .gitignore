@@ -221,3 +221,6 @@ __marimo__/
 
 # Cloudflare Tunnel Binary
 cloudflared.exe
+
+# Local test-data seeder (writes ~1,000 fake transactions; local databases only)
+scripts/seed_test_data.py
