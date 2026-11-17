@@ -122,11 +122,46 @@ Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending li
 
 ```http
 GET /api/v1/limits   -> overall `weekly`/`monthly`, plus `categories`: [{category, weekly, monthly}]
+                        and `merchants`: [{id, merchant, counts, weekly, monthly}]
 PUT /api/v1/limits   {"weekly_limit": "5000", "monthly_limit": null}                            (overall)
 PUT /api/v1/limits   {"category": "Food & Dining", "weekly_limit": "1500", "monthly_limit": null}
 ```
 
-Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start. The summary is two queries however many limits you set.
+Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start.
+
+**Per merchant:** a limit on one merchant name, such as Swiggy, with the same weekly/monthly periods, meter and one-time notification ("Monthly Swiggy limit crossed"). It counts every parsed INR debit (yours, plus SMS from the Shortcut) whose merchant name contains the limit's name as the **same whole words with the same case**; anything that isn't a letter, digit or combining mark (such as the vowel signs in "स्विगी") separates words. Names are compared in Unicode NFC, so "Café" typed with a separate accent is the same name. Matching lives in `merchants.py` and runs in Python, so no database collation changes the answer. A "Swiggy" limit counts "Swiggy" and "Swiggy Ltd", but not:
+
+- "SWIGGY" or "swiggy ltd" (different case; an SMS read by Gemini keeps the bank's capitals),
+- "Swiggyone" or "Amazonpayindiap" for Amazon (not a whole word),
+- "Cult.fit" for a "Cult Fit" limit ("fit" isn't "Fit"), and "Kolar Stores" never counts toward Ola.
+
+Each limit's `counts` lists the names it has counted, all time, most payments first, so you can see what's included. It's checked on the same events as a category limit (an SMS, adding or editing a transaction, the AI retry), after the overall and category checks and on its own, so a failure in it can't stop theirs. One payment can cross the overall, a category and a merchant limit at once; each notifies separately. With Gmail set up, a merchant alert also sends one email, best effort (not retried), like a category alert.
+
+```http
+PUT /api/v1/limits/merchants   {"merchant": "Swiggy", "weekly_limit": null, "monthly_limit": "3000", "category": null}
+                               -> the full summary, like PUT /api/v1/limits
+GET /api/v1/limits/merchants/known              -> [{"name": "Swiggy", "payments": 42}, …]
+GET /api/v1/limits/merchants/preview?merchant=…  -> {"known": true, "counts": ["Swiggy", "Swiggy Ltd"]}
+```
+
+The name is put in NFC, trimmed and its spaces collapsed; it needs at least one word and up to 255 characters, and can't contain control characters (such as NUL) or broken Unicode (a lone surrogate, or U+FFFD): 422 "Merchant names can't contain invalid characters." Saving:
+
+1. A limit with exactly this name exists: its amounts change, or both null removes it. `category` is ignored.
+2. Otherwise, both amounts null does nothing.
+3. A **known** name (one you've paid, or typed before, with the same case once both are cleaned, so a payment stored as "Amazon  Pay" makes "Amazon Pay" known) gets the limit; `category` is ignored.
+4. A new name needs `category`, a spending category (422 "Pick a category for this new merchant." without it). The name is saved as a known merchant exactly as typed, and the category goes into merchant memory, unless memory already has one for that name in any case (a typed "swiggy" never changes what "Swiggy" gets).
+5. All in one commit; two simultaneous saves end with one limit.
+
+Known merchants are every name you've paid in INR ("Swiggy" and "SWIGGY" are two) plus the typed ones, cleaned (names that are the same once cleaned are one entry, their payments added), most payments first. The preview also reports a name with a limit as known. It never errors: an empty name, one with no words, one over 255 characters or one with invalid characters gives `{"known": false, "counts": []}`. Merchant limits live in `merchant_limits` and typed merchants in `known_merchants`, both added by `create_all`; a typed merchant stays known after its limit is deleted. Each table is unique on a SHA-256 of the exact name (`merchant_hash`, `name_hash`) rather than the name, because MySQL's default collation would treat "Swiggy" and "SWIGGY" as one. The production collation of `transactions.merchant` (`SHOW FULL COLUMNS FROM transactions LIKE 'merchant'`) is not recorded here yet; nothing depends on it.
+
+Round trips to the database (about 277 ms each to TiDB from India):
+
+| Path | Round trips |
+| --- | --- |
+| `GET /api/v1/limits`, no merchant limits | 3: limits, merchant limits, every meter in one query |
+| `GET /api/v1/limits`, with merchant limits | 4: plus one read of your INR debits, matched in Python |
+| Alert check after a debit | as before, +1 to load merchant limits, +1 more when one matches |
+| `PUT /api/v1/limits/merchants` | about 8: the existing limit, the known check, the memory check, the writes, then the summary |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.
 
