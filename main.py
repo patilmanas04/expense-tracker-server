@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from database import get_db, init_db
 from models import Transaction, User
 import categorize
+import duplicates
 from parser import CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, compute_message_hash, detect_category, parse_sms
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
@@ -131,6 +132,7 @@ class TransactionResponse(BaseModel):
     transaction_time: datetime
     created_at: datetime
     updated_at: datetime  # moves on every edit; the dashboard polls by it
+    duplicate_of: Optional[uuid.UUID] = None  # the earlier transaction while this one is held out as a possible duplicate
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -180,9 +182,11 @@ async def ingest_sms_webhook(
     2. Hashes message to guarantee idempotency and prevent duplicate entries.
     3. Parses SMS with fast Regex rules, falling back to Gemini AI Agent if uncertain
        (full parse when regex fails, category only when regex cannot categorize).
-    4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible).
+    4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible), and flags a possible duplicate of
+       an earlier transaction in the same commit (duplicates.py); a flagged one is held out of totals.
     5. Returns the updated running balance when one is set in Settings.
-    6. After responding, emails an alert if a weekly/monthly spend limit was reached.
+    6. After responding, emails an alert if a weekly/monthly spend limit was reached (not for a
+       possible duplicate, which counts nowhere until you decide).
     """
     raw_text = (payload.message or "").strip()
 
@@ -224,6 +228,10 @@ async def ingest_sms_webhook(
     tx_time = payload.received_at or parsed.transaction_time or datetime.now(timezone.utc)
     tx_time = tx_time.astimezone(timezone.utc)
 
+    # Duplicate detection needs the owner; with none configured it's skipped.
+    owner = await duplicates.owner_for_webhook(db)
+    owner_id = owner.id if owner else None  # read now: a later rollback expires the object
+
     # 3. Create database record
     new_txn = Transaction(
         type=parsed.type,
@@ -247,7 +255,11 @@ async def ingest_sms_webhook(
     )
 
     db.add(new_txn)
+    found = None
     try:
+        await db.flush()  # the message_hash unique check fires here
+        if owner is not None:
+            found = await duplicates.flag_if_duplicate(db, owner, new_txn)  # same commit: no poll sees it unflagged
         await db.commit()
     except IntegrityError:
         # A retry can race the pre-insert check; the unique constraint is authoritative.
@@ -260,15 +272,21 @@ async def ingest_sms_webhook(
             transaction=TransactionResponse.model_validate(existing_txn),
             balance=await balance_after(db),
         )
-    await db.refresh(new_txn)
-    # Runs after the response is sent, so the iPhone Shortcut never waits on Gmail.
-    background_tasks.add_task(check_spend_limits, new_txn.id)
+    if found:
+        await duplicates.notify(db, owner_id, new_txn, found)  # its own commit; never fails the save
+    await db.refresh(new_txn)  # also loads duplicate_of
+    if not found:  # a held-out payment counts nowhere, so it can't reach a limit
+        # Runs after the response is sent, so the iPhone Shortcut never waits on Gmail.
+        background_tasks.add_task(check_spend_limits, new_txn.id)
     if parsed.ai_category_pending:  # Gemini was too slow; try again with more time
         background_tasks.add_task(categorize.retry_ai_category, new_txn.id)
 
+    message = f"Transaction logged successfully via {parsed.parsed_by}"
+    if found:
+        message += " (possible duplicate: held out of totals)"
     return WebhookResponse(
         status="success",
-        message=f"Transaction logged successfully via {parsed.parsed_by}",
+        message=message,
         transaction=TransactionResponse.model_validate(new_txn),
         balance=await balance_after(db),
     )
@@ -389,7 +407,8 @@ async def add_transaction(
 ):
     """For cash and anything without an SMS. Counts in totals and spend limits like an SMS;
     cash entries don't change the bank balance. A category you pick is remembered for the merchant;
-    "Auto" uses that memory, the keyword rules, then Gemini in the background."""
+    "Auto" uses that memory, the keyword rules, then Gemini in the background. A possible duplicate of
+    an SMS is held out of totals until you decide (duplicates.py)."""
     now = datetime.now(timezone.utc)
     if body.category:
         category = body.category
@@ -413,9 +432,14 @@ async def add_transaction(
         updated_at=now,
     )
     db.add(txn)
+    await db.flush()
+    found = await duplicates.flag_if_duplicate(db, user, txn)  # same commit as the transaction
     await db.commit()
-    await db.refresh(txn)
-    background_tasks.add_task(check_spend_limits, txn.id)
+    if found:
+        await duplicates.notify(db, user.id, txn, found)  # its own commit; never fails the save
+    await db.refresh(txn)  # also loads duplicate_of
+    if not found:  # a held-out payment counts nowhere, so it can't reach a limit
+        background_tasks.add_task(check_spend_limits, txn.id)
     if category == UNCATEGORIZED and os.getenv("GEMINI_API_KEY"):
         background_tasks.add_task(categorize.retry_ai_category, txn.id)
     return TransactionResponse.model_validate(txn)
@@ -464,6 +488,27 @@ async def edit_transaction(
     return TransactionResponse.model_validate(txn)
 
 
+@app.post(
+    "/api/v1/transactions/{transaction_id}/not-duplicate",
+    response_model=TransactionResponse,
+    dependencies=[Depends(same_origin)],
+    tags=["Transactions"],
+    summary="Count a possible duplicate again",
+)
+async def not_duplicate(
+    transaction_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Clears the possible-duplicate flag: the transaction counts again and is never flagged again.
+    404 when it isn't yours; 409 "Not a pending duplicate." when it isn't flagged or was already decided."""
+    txn = await duplicates.dismiss(db, user, transaction_id)
+    await db.refresh(txn)  # also loads duplicate_of (now null)
+    background_tasks.add_task(check_spend_limits, txn.id)  # it counts again, so it can reach a limit
+    return TransactionResponse.model_validate(txn)
+
+
 @app.delete(
     "/api/v1/transactions/{transaction_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -473,14 +518,18 @@ async def edit_transaction(
 )
 async def delete_transaction(
     transaction_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Deletes an SMS or a hand-added entry for good. If the Shortcut sends the same SMS again,
-    it's recorded again."""
+    it's recorded again. Deleting the earlier of two possible duplicates makes the other count again."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
+    released = await duplicates.release(db, txn.id)  # same commit as the delete
     await db.delete(txn)
     await db.commit()
+    for released_id in released:  # they count again, so they can reach a limit
+        background_tasks.add_task(check_spend_limits, released_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

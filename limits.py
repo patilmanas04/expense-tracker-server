@@ -3,7 +3,7 @@ each is reached, an in-app notification is created (bell on Home), plus a Gmail 
 keys are configured (optional; retried for overall limits, best effort for category and merchant
 limits).
 
-"Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance).
+"Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance), and not possible duplicates waiting for your decision (duplicates.py).
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
 Which payments a merchant limit counts is decided in merchants.py.
 """
@@ -33,7 +33,7 @@ from models import (CategoryLimit, KnownMerchant, MerchantCategory, MerchantLimi
                     SpendLimit, Transaction, User)
 from notifications import create_once
 from parser import CATEGORIES, UNCATEGORIZED
-from spending import EXCLUDED_FROM_SPENDING, counts_as_spending, spending_category_filter
+from spending import EXCLUDED_FROM_SPENDING, counted_filter, counts_as_spending, is_held_out
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ def _spent_query(user: User, currency: str, start: datetime, end: datetime, cate
         Transaction.currency == currency,
         Transaction.transaction_time >= start,
         Transaction.transaction_time < end,
-        spending_category_filter(),
+        counted_filter(),
     )
     return query.where(Transaction.category == category) if category else query
 
@@ -137,14 +137,14 @@ def _merchant_notification_key(limit_id: uuid.UUID, period: str, start: date, li
 def merchant_debits(user: User, currency: str, since: Optional[datetime] = None):
     """(merchant, amount, time) of every payment a merchant limit can count. The summary, the
     alert check, known merchants and the preview all read through this, so they always agree.
-    Only spending counts (spending.py), so a merchant paid only in excluded categories isn't known and
-    its limit shows ₹0."""
+    Only counted spending (spending.counted_filter), so a merchant paid only in excluded categories isn't
+    known and its limit shows ₹0, and a possible duplicate waiting for your decision isn't counted."""
     query = select(Transaction.merchant, Transaction.amount, Transaction.transaction_time).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
         Transaction.currency == currency,
-        spending_category_filter(),
+        counted_filter(),
     )
     return query if since is None else query.where(Transaction.transaction_time >= since)
 
@@ -709,6 +709,8 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
     owner = await db.scalar(select(User).where(User.email == OWNER_EMAIL))
     if owner is None or txn.user_id not in (None, owner.id):
         return
+    if await is_held_out(db, txn.id):
+        return  # a possible duplicate counts nowhere until you decide
     # When create_once loses a race to a simultaneous SMS it rolls back, which expires every object
     # in the session, and reading an expired one fails under asyncio (no lazy loads). From here on
     # these two are only read, so they're detached; limits are read into plain values.

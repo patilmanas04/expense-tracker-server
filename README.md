@@ -60,7 +60,7 @@ X-Webhook-Secret: YOUR_EXISTING_WEBHOOK_SECRET
 
 Create a Message automation for your bank sender, then **Get Contents of URL**, POST, JSON body. Put the message variable in `message`, not the literal text "Shortcut Input". Set the secret header. `sender` and `received_at` are optional; any supplied date must be ISO 8601 with a timezone. Manual Play testing needs a Text action containing sample SMS text. `Authorization: Bearer ...` remains supported.
 
-`success`, `duplicate`, and `ignored` responses use HTTP 200. Unknown formats are preserved with `is_parsed=false`, marked for review and excluded from totals. Analytics separate currencies, calculate amounts using Decimal, and use Asia/Kolkata dates. Net cash flow is income minus expenses for the selected period, not an account balance. Table filters do not alter period charts/totals. CSV export covers the current page.
+`success`, `duplicate`, and `ignored` responses use HTTP 200. When the SMS looks like a second record of an earlier transaction (see Possible duplicates), the status is still `success` and the message reads "Transaction logged successfully via regex (possible duplicate: held out of totals)", so the Shortcut can show why Balance left didn't move. Unknown formats are preserved with `is_parsed=false`, marked for review and excluded from totals. Analytics separate currencies, calculate amounts using Decimal, and use Asia/Kolkata dates. Net cash flow is income minus expenses for the selected period, not an account balance. Table filters do not alter period charts/totals. CSV export covers the current page.
 
 ## Live updates
 
@@ -94,6 +94,26 @@ Each SMS gets its category from, in order:
 
 Every other category counts, including Cash Withdrawal, Transfer, Uncategorized and no category: debits as spending, credits as income. Net flow is income − spending − invested. The app keeps a copy of both sets in `expense-tracker-client/lib/categories.ts`; `tests/test_spending.py` compares them (and the category order) when both repos sit side by side. Past months' figures change once when this ships, because card bills, self transfers and investments stop counting retroactively.
 
+## Possible duplicates
+
+Banks sometimes send two differently worded SMS for one payment, and an SMS can arrive for a payment you already added by hand. `duplicates.py` compares each newly saved transaction (SMS or hand-added) with your transactions saved **before** it whose time is within 3 days, with the same amount, direction and currency (unreadable SMS are never compared). It's a possible duplicate when:
+
+1. **Same reference number** (UPI ref / UTR): `reason = "reference"`.
+2. **Same details** within 10 minutes: the same merchant, ignoring case and spacing; when either side has no merchant, the same account instead (`"same_details"`). Two different merchants never match, even on one account.
+3. **Hand entry and SMS** within 24 hours: exactly one of the two was added by hand as **Bank account** (cash never matches, and two hand entries never match): `"manual_entry"`.
+
+The lowest rule wins, then the closest time, then the most recently saved. The windows are the constants `LOOKBACK`, `SAME_DETAILS` and `MANUAL_ENTRY` in `duplicates.py`.
+
+The newer transaction (saved later) is flagged in the same commit as it is saved (`duplicate_flags`, a new table `create_all` adds) and **held out** of every total while you decide: Spent, Income, Invested, every spend limit (no limit alert for it) and the bank balance. Server code filters with `spending.not_held_out()` / `spending.counted_filter()` in SQL and `spending.is_held_out()` for one transaction; the app uses `isHeldOut()` / `needsReview()`. It shows greyed under **Needs review**, and a bell notification says so ("Possible duplicate: ₹500.00 at Swiggy" / "Same reference number as the payment at 10:02 am"), linking to `/activity?kind=review`.
+
+```http
+POST /api/v1/transactions/{id}/not-duplicate   -> 200 the transaction; 404 not yours; 409 "Not a pending duplicate."
+```
+
+**Not a duplicate** (session + `Origin`) clears the flag: the transaction counts again, its limit check runs, and it's never flagged again (the dismissed row stays). A second tap gets 409. Deleting the flagged transaction removes its flag; deleting the **earlier** one releases the newer one, which counts again (its `updated_at` moves, so the app sees it on the next poll) and gets its limit check. Nothing is ever deleted automatically.
+
+Detection only runs when a transaction is saved: past transactions aren't scanned, and editing one doesn't re-check it (a flag stays until you decide). Two SMS saved at the same moment can't flag each other, so a race can leave both counted, never both held out. Every transaction response carries `duplicate_of`: the earlier transaction's id while this one is held out, else `null`.
+
 ## Bank balance
 
 Set your current bank balance in the dashboard's Settings. From that moment, every parsed debit SMS is subtracted and every credit added. Saving a new amount restarts the count from then.
@@ -101,6 +121,7 @@ Set your current bank balance in the dashboard's Settings. From that moment, eve
 - Credit-card alerts (`BLOCK CC`, `Avl Limit`, `Cardmember`, "credit card" without a bank account) are **not** deducted. A card spend leaves your account when you pay the card bill, and that payment arrives as its own bank debit SMS. Card bills paid from an account (`… debited from A/c … towards … Credit Card`) do count.
 - Unparsed SMS (`is_parsed=false`) and other currencies are not counted.
 - Transactions added by hand as **Cash** are not counted either (they never pass through the bank). Ones added as **Bank account** count like an SMS.
+- Possible duplicates waiting for your decision are not counted (see Possible duplicates).
 - The value lives in the `balance_settings` table, which `create_all` adds automatically on the next server start.
 
 ```http
@@ -125,7 +146,7 @@ PATCH  /api/v1/transactions/{id}   any of: type, amount, merchant, category, tra
 DELETE /api/v1/transactions/{id}   -> 204; any of your transactions, SMS or hand-added
 ```
 
-All three need the dashboard session and `Origin`. A delete is permanent; if the Shortcut sends the same SMS again it's recorded again. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification.
+All three need the dashboard session and `Origin`. A delete is permanent; if the Shortcut sends the same SMS again it's recorded again. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification. A **Bank account** entry and a bank SMS for the same amount within 24 hours, in either order, flag the later one as a possible duplicate (see Possible duplicates).
 
 ## Spend limits, notifications and (optional) email alerts
 
@@ -251,7 +272,7 @@ Remaining considerations:
 
 - Configure request-body/rate limits at the public reverse proxy, use stable HTTPS, and introduce migrations when models change (`create_all` does not migrate existing columns).
 - `GET /api/v1/dashboard` was removed (nothing called it; the app computes its totals from `/api/v1/transactions`). Queue ingestion if volume increases.
-- Hash deduplication treats identical normalized SMS text as the same event. Distinct identical messages require a bank/event identifier to distinguish them.
+- Hash deduplication treats identical normalized SMS text as the same event. Distinct identical messages require a bank/event identifier to distinguish them. Differently worded SMS of one payment are saved, then flagged as possible duplicates and held out of totals (see Possible duplicates).
 - Parsing order: regex (tuned for HDFC/ICICI account, card and UPI alerts; the earliest debit/credit keyword decides direction, and balance/limit/due amounts are never used as the transaction amount) → Gemini full parse if regex cannot find a type and amount → Gemini category-only call if regex parsed it but no keyword rule matched (`parsed_by=regex+ai`) → `Uncategorized`. Categories are listed in `parser.CATEGORIES`.
 - Bank formats vary. The parser uses the first currency-labelled amount that is not a balance/limit; it does not extract embedded SMS dates. `received_at` (or receipt time) drives the dashboard date. Verify your bank's formats.
 - On regex failure, the existing Gemini integration sends the SMS to Google. Remove `GEMINI_API_KEY` to preserve unmatched messages locally for review instead. Set `GEMINI_MODEL` to one available to your account; the original model default is retained. Editing review records is outside this read-only dashboard.

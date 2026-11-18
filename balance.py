@@ -1,7 +1,8 @@
 """Running bank balance: the amount the owner enters, adjusted by every parsed
 transaction recorded after it. Credit-card alerts are skipped because card spends
 leave the bank account only when the card bill is paid, which is its own debit SMS.
-Cash entries added by hand are skipped too: they never pass through the bank."""
+Cash entries added by hand are skipped too: they never pass through the bank. Possible duplicates
+waiting for your decision (duplicates.py) are skipped too."""
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
@@ -17,6 +18,7 @@ from dashboard import ownership
 from database import get_db
 from models import BalanceSetting, Transaction, User
 from parser import BANK_ACCOUNT_RE, CARD_RE, card_text
+from spending import not_held_out
 
 router = APIRouter(prefix="/api/v1/balance", tags=["Balance"])
 
@@ -64,6 +66,7 @@ async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> Ba
             Transaction.is_parsed.is_(True),
             Transaction.currency == setting.currency,
             Transaction.transaction_time > _utc(setting.as_of),
+            not_held_out(),
         )
     )).all()
     spent = received = Decimal(0)

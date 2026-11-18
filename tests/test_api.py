@@ -210,6 +210,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
             empty_result.scalars.return_value.first.return_value = None
             fake_db.execute.return_value = empty_result
             fake_db.add = MagicMock()
+            fake_db.flush.side_effect = IntegrityError("insert", {}, Exception("unique constraint"))
             fake_db.commit.side_effect = IntegrityError("insert", {}, Exception("unique constraint"))
             fake_db.scalar.return_value = row
             async def override_db():

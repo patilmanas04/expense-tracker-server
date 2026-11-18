@@ -15,9 +15,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    select,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from database import Base
@@ -601,3 +602,60 @@ class KnownMerchant(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "name_hash", name="uq_known_merchant"),
     )
+
+
+DUPLICATE_PENDING = "pending"  # held out of every total until you decide
+DUPLICATE_DISMISSED = "dismissed"  # "Not a duplicate": counts, and is never flagged again
+
+
+class DuplicateFlag(Base):
+    """A transaction that may be a second record of an earlier one (duplicates.py). While pending it's
+    held out of every total; a dismissed row stays so the transaction is never flagged again. Rows are
+    removed explicitly when either transaction is deleted (the foreign keys are only a backup)."""
+
+    __tablename__ = "duplicate_flags"
+
+    transaction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        primary_key=True,
+    )  # the newer one, held out while pending
+    original_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )  # the earlier one
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )  # "reference", "same_details" or "manual_entry"
+    status: Mapped[str] = mapped_column(
+        String(10),
+        default=DUPLICATE_PENDING,
+        nullable=False,
+    )  # "pending" or "dismissed"
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    decided_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  # set by "Not a duplicate"
+
+
+# The original's id while the flag is pending, else None: every TransactionResponse carries it (one
+# sub-select per row, on the primary key). Loaded with the row, so refresh a new row before reading it.
+Transaction.duplicate_of = column_property(
+    select(DuplicateFlag.original_id)
+    .where(DuplicateFlag.transaction_id == Transaction.id, DuplicateFlag.status == DUPLICATE_PENDING)
+    .correlate_except(DuplicateFlag)
+    .scalar_subquery()
+)
