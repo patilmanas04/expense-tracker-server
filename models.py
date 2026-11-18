@@ -750,6 +750,33 @@ class CategoryRule(Base):
     )
 
 
+class UserSetting(Base):
+    """Your preferences, one row per setting (settings_store.KEYS). Only preferences: feature state lives in the
+    feature's own table. A missing row means the default; a stored JSON null means Off."""
+
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    # KEY is a reserved word in MySQL/TiDB. SQLAlchemy quotes it, so no raw SQL may use this table.
+    key: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )  # e.g. "alerts.large_amount"
+    value: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )  # JSON text, e.g. 5000, null, true
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )  # set in Python
+
+
 # The original's id while the flag is pending, else None: every TransactionResponse carries it (one
 # sub-select per row, on the primary key). Loaded with the row, so refresh a new row before reading it.
 Transaction.duplicate_of = column_property(

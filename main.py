@@ -20,14 +20,22 @@ from database import get_db, init_db
 from models import Transaction, User
 import categorize
 import duplicates
+import limits
+import payment_alerts
+import post_save
 import rules
+import settings_store
 from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
                     detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
-from limits import check_spend_limits, router as limits_router
+from limits import router as limits_router
 from notifications import router as notifications_router
 from dashboard import ownership
+
+# After-save checks (post_save.py), in the order they run. Later designs add their line here.
+post_save.register("limits", limits.post_save_check, {"sms", "manual", "edit", "ai_retry", "restored"})
+post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai_retry", "restored"})
 
 load_dotenv()
 
@@ -72,6 +80,7 @@ app.include_router(limits_router)
 app.include_router(notifications_router)
 app.include_router(rules.names_router)
 app.include_router(rules.rules_router)
+app.include_router(settings_store.router)
 
 
 @app.middleware("http")
@@ -191,8 +200,9 @@ async def ingest_sms_webhook(
     4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible), and flags a possible duplicate of
        an earlier transaction in the same commit (duplicates.py); a flagged one is held out of totals.
     5. Returns the updated running balance when one is set in Settings.
-    6. After responding, emails an alert if a weekly/monthly spend limit was reached (not for a
-       possible duplicate, which counts nowhere until you decide).
+    6. After responding, runs the after-save checks (post_save.py): spend limits (a notification, and
+       an email if Gmail is set up) and payment alerts (a large or unusual payment). Not for a possible
+       duplicate, which counts nowhere until you decide.
     """
     raw_text = (payload.message or "").strip()
 
@@ -291,9 +301,9 @@ async def ingest_sms_webhook(
     if found:
         await duplicates.notify(db, owner_id, new_txn, found)  # its own commit; never fails the save
     await db.refresh(new_txn)  # also loads duplicate_of
-    if not found:  # a held-out payment counts nowhere, so it can't reach a limit
+    if not found:  # a held-out payment counts nowhere, so it gets no after-save checks
         # Runs after the response is sent, so the iPhone Shortcut never waits on Gmail.
-        background_tasks.add_task(check_spend_limits, new_txn.id)
+        background_tasks.add_task(post_save.run, new_txn.id, "sms")
     if parsed.ai_category_pending:  # Gemini was too slow; try again with more time
         background_tasks.add_task(categorize.retry_ai_category, new_txn.id)
 
@@ -462,8 +472,8 @@ async def add_transaction(
     if found:
         await duplicates.notify(db, user.id, txn, found)  # its own commit; never fails the save
     await db.refresh(txn)  # also loads duplicate_of
-    if not found:  # a held-out payment counts nowhere, so it can't reach a limit
-        background_tasks.add_task(check_spend_limits, txn.id)
+    if not found:  # a held-out payment counts nowhere, so it gets no after-save checks
+        background_tasks.add_task(post_save.run, txn.id, "manual")
     if category == UNCATEGORIZED and os.getenv("GEMINI_API_KEY"):
         background_tasks.add_task(categorize.retry_ai_category, txn.id)
     return TransactionResponse.model_validate(txn)
@@ -508,7 +518,7 @@ async def edit_transaction(
     await db.commit()
     await db.refresh(txn)
     if txn.is_parsed and txn.type == "DEBIT" and changes.keys() - {"notes"}:
-        background_tasks.add_task(check_spend_limits, txn.id)  # a bigger amount can cross a limit
+        background_tasks.add_task(post_save.run, txn.id, "edit")  # after-save checks: a bigger amount can cross a limit
     return TransactionResponse.model_validate(txn)
 
 
@@ -529,7 +539,7 @@ async def not_duplicate(
     404 when it isn't yours; 409 "Not a pending duplicate." when it isn't flagged or was already decided."""
     txn = await duplicates.dismiss(db, user, transaction_id)
     await db.refresh(txn)  # also loads duplicate_of (now null)
-    background_tasks.add_task(check_spend_limits, txn.id)  # it counts again, so it can reach a limit
+    background_tasks.add_task(post_save.run, txn.id, "restored")  # it counts again: the after-save checks run
     return TransactionResponse.model_validate(txn)
 
 
@@ -554,6 +564,6 @@ async def delete_transaction(
     released = await duplicates.release(db, txn.id)  # same commit as the delete
     await db.delete(txn)
     await db.commit()
-    for released_id in released:  # they count again, so they can reach a limit
-        background_tasks.add_task(check_spend_limits, released_id)
+    for released_id in released:  # they count again: the after-save checks run
+        background_tasks.add_task(post_save.run, released_id, "restored")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

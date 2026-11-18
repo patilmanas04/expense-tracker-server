@@ -23,9 +23,9 @@ from typing import Optional
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import post_save
 from auth import OWNER_EMAIL
 from database import AsyncSessionLocal
-from limits import check_spend_limits
 from models import MerchantCategory, Transaction, User
 from parser import UNCATEGORIZED, Recalled, categorize_with_gemini
 
@@ -129,7 +129,7 @@ async def _attempt(transaction_id: uuid.UUID) -> bool:
         ))
         await db.commit()
     if result.rowcount:
-        await check_spend_limits(transaction_id)  # it may now count toward a category limit
+        await post_save.run(transaction_id, "ai_retry")  # every after-save check: the new category may count toward a limit
     return True
 
 

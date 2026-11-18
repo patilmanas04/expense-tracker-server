@@ -107,13 +107,13 @@ Banks sometimes send two differently worded SMS for one payment, and an SMS can 
 
 The lowest rule wins, then the closest time, then the most recently saved. The windows are the constants `LOOKBACK`, `SAME_DETAILS` and `MANUAL_ENTRY` in `duplicates.py`.
 
-The newer transaction (saved later) is flagged in the same commit as it is saved (`duplicate_flags`, a new table `create_all` adds) and **held out** of every total while you decide: Spent, Income, Invested, every spend limit (no limit alert for it) and the bank balance. Server code filters with `spending.not_held_out()` / `spending.counted_filter()` in SQL and `spending.is_held_out()` for one transaction; the app uses `isHeldOut()` / `needsReview()`. It shows greyed under **Needs review**, and a bell notification says so ("Possible duplicate: ₹500.00 at Swiggy" / "Same reference number as the payment at 10:02 am"), linking to `/activity?kind=review`.
+The newer transaction (saved later) is flagged in the same commit as it is saved (`duplicate_flags`, a new table `create_all` adds) and **held out** of every total while you decide: Spent, Income, Invested, every spend limit (no limit or payment alert for it) and the bank balance. Server code filters with `spending.not_held_out()` / `spending.counted_filter()` in SQL and `spending.is_held_out()` for one transaction; the app uses `isHeldOut()` / `needsReview()`. It shows greyed under **Needs review**, and a bell notification says so ("Possible duplicate: ₹500.00 at Swiggy" / "Same reference number as the payment at 10:02 am"), linking to `/activity?kind=review`.
 
 ```http
 POST /api/v1/transactions/{id}/not-duplicate   -> 200 the transaction; 404 not yours; 409 "Not a pending duplicate."
 ```
 
-**Not a duplicate** (session + `Origin`) clears the flag: the transaction counts again, its limit check runs, and it's never flagged again (the dismissed row stays). A second tap gets 409. Deleting the flagged transaction removes its flag; deleting the **earlier** one releases the newer one, which counts again (its `updated_at` moves, so the app sees it on the next poll) and gets its limit check. Nothing is ever deleted automatically.
+**Not a duplicate** (session + `Origin`) clears the flag: the transaction counts again, its after-save checks run (limits and payment alerts, cause `restored`), and it's never flagged again (the dismissed row stays). A second tap gets 409. Deleting the flagged transaction removes its flag; deleting the **earlier** one releases the newer one, which counts again (its `updated_at` moves, so the app sees it on the next poll) and gets its after-save checks. Nothing is ever deleted automatically.
 
 Detection only runs when a transaction is saved: past transactions aren't scanned, and editing one doesn't re-check it (a flag stays until you decide). Two SMS saved at the same moment can't flag each other, so a race can leave both counted, never both held out. Every transaction response carries `duplicate_of`: the earlier transaction's id while this one is held out, else `null`.
 
@@ -189,6 +189,65 @@ All need the dashboard session; writes (the preview included) also need the dash
 
 **Deleting** a merge or a rule stops it for future payments only: names and categories already changed stay. Editing a payment never runs merges or rules again.
 
+## Settings
+
+**Settings → Alerts** in the app. Every setting is one row in `settings_store.KEYS` (its default and its validation), stored as JSON text in `user_settings` (one row per setting, added by `create_all`), so a new setting needs no new column.
+
+```http
+GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true}   (every key, always in this order)
+PUT /api/v1/settings   {"alerts.large_amount": 5000}   -> the full object after saving
+```
+
+| Key | Value | Default |
+| --- | --- | --- |
+| `alerts.large_amount` | whole rupees, 1 to 1,00,00,000, or `null` (Off) | `null` (Off) |
+| `alerts.unusual` | `true` / `false` | `true` |
+
+Both need the dashboard session (401 "Please sign in…" without it); `PUT` also needs the dashboard `Origin` (403 "Invalid request origin."). `PUT` is partial: it changes only the keys given, and `{}` changes nothing. Validation is strict JSON typing: an amount must be a JSON integer (`5000.0` is taken as `5000`); `true`, `"5000"` and `5000.5` are rejected, and `alerts.unusual` takes only `true` or `false`. Every key is checked before anything is written, so a 422 writes nothing; it names the first bad key in the body's order:
+
+- `{"detail": "Unknown setting: <key>"}` (the key cut to 64 characters),
+- `{"detail": "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."}`,
+- `{"detail": "alerts.unusual: Choose on or off."}`.
+
+A body that isn't a JSON object gets FastAPI's own 422 (a list `detail`). A missing row means the default; a stored `null` is a value (for `alerts.large_amount`, Off). A stored value that no longer passes its key's rules is logged and read as the default. Two first saves of the same key at once end with one row (the loser's commit fails and it updates the winner's row). `KEY` is a reserved word in MySQL/TiDB: SQLAlchemy quotes it, and no raw SQL may use this table.
+
+## After a payment is saved
+
+One background task, `post_save.run(transaction_id, cause)`, runs every check that follows a saved, edited or re-categorised payment, after the response is sent. It resolves the owner, loads the transaction and your settings once (4 queries), then runs each registered check whose causes include this one, in the order they're registered (one block in `main.py`). Each check runs on its own: one failing is logged and the others still run; nothing it does can fail the save.
+
+| Cause | When |
+| --- | --- |
+| `sms` | the webhook saved an SMS |
+| `manual` | you added a payment by hand |
+| `edit` | you edited a parsed debit and changed more than its note |
+| `ai_retry` | Gemini filled the category in later |
+| `restored` | "Not a duplicate", or deleting the original of a held-out row made it count again |
+
+| Check | Causes |
+| --- | --- |
+| `limits` (overall, category and merchant limits) | all five |
+| `payment_alerts` (large or unusual payment) | `sms`, `manual`, `ai_retry`, `restored` (not `edit`: an edit is your own change) |
+
+A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
+
+Cost per saved SMS once every planned check ships, one check at a time and after the reply: the runner's 4 queries, limits 6–8, payment alerts 1, low balance 2, recurring about 5, refunds 1–2 for credits, transfers 1–2 for parsed SMS: about 20 round trips, 4–6 s on TiDB, which nothing waits for. A restart drops queued tasks.
+
+## Payment alerts
+
+Two switches in **Settings → Alerts**, each giving an in-app notification (no email):
+
+- **Payments over** (`alerts.large_amount`, Off by default): a payment over the amount ("Large payment"). Equal is not over.
+- **Unusual for the merchant** (`alerts.unusual`, On by default): a payment at least **3×** what you usually spend at that merchant and at least **₹500** ("Unusual payment"). "Usually" is the median of your earlier payments there in the last **180 days**, needing at least **3** of them: parsed INR debits that count as spending (What counts as spending), not held-out duplicates, yours or unassigned SMS rows, before this payment's time. Merchants are matched by `categorize.merchant_key`, so "Swiggy", "SWIGGY" and " swiggy " share a history, but "Swiggy Instamart" doesn't. Amounts are whole payments.
+
+The four numbers are first guesses, kept as constants in `payment_alerts.py` (`UNUSUAL_FACTOR`, `UNUSUAL_FLOOR`, `HISTORY_DAYS`, `MIN_HISTORY`).
+
+One notification per payment (`kind = "payment_alert"`, dedupe key `payment_alert:<id>`); when both match it's one "Large and unusual payment". It links to `/activity?txn=<id>`, which opens the payment in Activity. Bodies use the money format of every other notification:
+
+- "₹8,000.00 at Croma"; with no merchant name (none, blank or "Unknown"), "₹8,000.00 payment";
+- unusual (alone or with large): "₹3,200.00 at Swiggy — about 9× what you usually spend there (₹350.00)" (the multiple rounded half up).
+
+Skipped: credits, other currencies, payments that need review, categories that aren't spending (Credit Card Payment, Self Transfer, Investments & Finance), and possible duplicates until you decide (after "Not a duplicate" the payment is checked then). Edits never alert. The check reads at most one query (the merchant's history), and none when the unusual rule is off, the payment is under ₹500 or has no merchant name.
+
 ## Spend limits, notifications and (optional) email alerts
 
 Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the app: parsed debits, card spends included, except Credit Card Payment, Self Transfer and Investments & Finance (see What counts as spending), so a card bill or an SIP never trips a limit. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
@@ -241,10 +300,11 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | --- | --- |
 | `GET /api/v1/limits`, no merchant limits | 3: limits, merchant limits, every meter in one query |
 | `GET /api/v1/limits`, with merchant limits | 4: plus one read of your INR debits, matched in Python |
-| Alert check after a debit | as before, +1 to load merchant limits, +1 more when one matches |
+| Limit check after a debit | as before, +1 to load merchant limits, +1 more when one matches |
 | `PUT /api/v1/limits/merchants` | about 8: the existing limit, the known check, the memory check, the writes, then the summary |
 | SMS webhook | +1 for your merged name and category rules (one statement); a rule that sets the category also saves the Gemini call |
 | `POST /api/v1/transactions` (adding by hand) | +1 for your merged name and category rules (one statement) |
+| After-save checks (background, after the reply) | 4 for the runner (owner, transaction, held-out test, settings), then the limit checks as above, then up to 1 for a payment alert's merchant history |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.
 

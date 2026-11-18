@@ -374,7 +374,7 @@ class FlowTests(DuplicatesTestCase):
 
     async def test_cuj2_deleting_the_hand_entry_releases_the_sms(self):
         await self.put("/api/v1/limits", {"monthly_limit": 100000})
-        with patch("main.check_spend_limits", new=AsyncMock()) as check:
+        with patch("post_save.run", new=AsyncMock()) as check:
             hand = await self.manual(1200, "DMart", NOW - 80 * MINUTE)
             sms = (await self.sms(DMART, NOW))["transaction"]
             self.assertEqual(sms["duplicate_of"], hand["id"])
@@ -395,6 +395,7 @@ class FlowTests(DuplicatesTestCase):
             self.assertEqual(await self.flags(), [])
             self.assertEqual(str(check.await_args_list[-1].args[0]), sms["id"])
             self.assertEqual(len(check.await_args_list), 2)
+            self.assertEqual([c.args[1] for c in check.await_args_list], ["manual", "restored"])
         self.assertIsNone((await self.listed())[sms["id"]]["duplicate_of"])
         self.assertEqual((await self.spent())["overall"], 1200)
 
@@ -409,11 +410,12 @@ class FlowTests(DuplicatesTestCase):
         self.assertIsNone(listed[cash["id"]]["duplicate_of"])
 
     async def test_sms_then_hand_entry(self):
-        with patch("main.check_spend_limits", new=AsyncMock()) as check:
+        with patch("post_save.run", new=AsyncMock()) as check:
             sms = (await self.sms(DMART, NOW))["transaction"]
             hand = await self.manual(1200, "DMart", NOW + 30 * MINUTE)
             self.assertEqual(hand["duplicate_of"], sms["id"])
             self.assertEqual([str(c.args[0]) for c in check.await_args_list], [sms["id"]])
+            self.assertEqual([c.args[1] for c in check.await_args_list], ["sms"])
         [notification] = await self.notifications()
         self.assertTrue(notification.body.startswith("Matches the bank SMS for ₹1,200.00 at "), notification.body)
         self.assertEqual(notification.title, "Possible duplicate: ₹1,200.00 at DMart")

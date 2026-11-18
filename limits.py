@@ -6,6 +6,9 @@ limits).
 "Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance), and not possible duplicates waiting for your decision (duplicates.py).
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
 Which payments a merchant limit counts is decided in merchants.py.
+
+The checks run after each saved payment through post_save.py (post_save_check, registered in main.py for every
+cause); check_spend_limits runs them alone, for rules.py's merges and rule applies.
 """
 import html
 import logging
@@ -26,14 +29,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import mailer
 import merchants
-from auth import FRONTEND_URL, OWNER_EMAIL, current_user, same_origin
+import post_save
+from auth import FRONTEND_URL, current_user, same_origin
 from dashboard import ownership
 from database import AsyncSessionLocal, get_db
 from models import (CategoryLimit, KnownMerchant, MerchantCategory, MerchantLimit, Notification, SpendAlert,
                     SpendLimit, Transaction, User)
 from notifications import create_once
 from parser import CATEGORIES, UNCATEGORIZED
-from spending import EXCLUDED_FROM_SPENDING, counted_filter, counts_as_spending, is_held_out
+from post_save import PostSave
+from spending import EXCLUDED_FROM_SPENDING, counted_filter, counts_as_spending
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -489,8 +494,7 @@ async def set_merchant_limit(body: MerchantLimitInput, user: User = Depends(curr
     """Sets the limit for one merchant name, exactly as given. Leaving both amounts empty removes
     it. A merchant you've never paid or typed needs a `category`: the name becomes a known
     merchant, and its category goes into merchant memory unless memory already has one for it."""
-    # categorize imports this module at its top, so a top-level import here would fail for any
-    # process that imports limits first.
+    # A local import, as before: categorize used to import this module at its top.
     import categorize
 
     name, key = body.merchant, merchants.name_hash(body.merchant)
@@ -586,7 +590,7 @@ async def send_test_email(user: User = Depends(current_user)):
     return {"status": "sent", "to": to}
 
 
-# ---------- Alerts (run after each webhook insert) ----------
+# ---------- Alerts (registered with post_save: run after each saved payment) ----------
 
 def _html_email(heading: str, body: str) -> str:
     return (
@@ -700,22 +704,12 @@ async def _notify_once(db: AsyncSession, user: User, period: str, start: date, e
     )
 
 
-async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
-    if not OWNER_EMAIL:
+async def post_save_check(ctx: PostSave) -> None:
+    """Registered with post_save for every cause: the overall, category and merchant limits this payment
+    can reach. post_save.load has already skipped other users' rows and held-out possible duplicates."""
+    db, owner, txn = ctx.db, ctx.owner, ctx.txn
+    if not txn.is_parsed or txn.type != "DEBIT" or not counts_as_spending(txn.category):
         return
-    txn = await db.get(Transaction, transaction_id)
-    if txn is None or not txn.is_parsed or txn.type != "DEBIT" or not counts_as_spending(txn.category):
-        return
-    owner = await db.scalar(select(User).where(User.email == OWNER_EMAIL))
-    if owner is None or txn.user_id not in (None, owner.id):
-        return
-    if await is_held_out(db, txn.id):
-        return  # a possible duplicate counts nowhere until you decide
-    # When create_once loses a race to a simultaneous SMS it rolls back, which expires every object
-    # in the session, and reading an expired one fails under asyncio (no lazy loads). From here on
-    # these two are only read, so they're detached; limits are read into plain values.
-    db.expunge(txn)
-    db.expunge(owner)
     now, when = utc_now(), _utc(txn.transaction_time)
     setting = await _setting(db, owner.id)
     if setting is not None and txn.currency == setting.currency:
@@ -742,6 +736,13 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
         logger.exception("Merchant limit check failed")
 
 
+async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
+    """Limits only, loaded the way the post-save runner loads (owner, transaction, held-out test, settings)."""
+    ctx = await post_save.load(db, transaction_id, "edit")
+    if ctx is not None:
+        await post_save_check(ctx)
+
+
 async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
     """The limit on this transaction's category: a notification, plus one best-effort email."""
     if txn.category not in LIMIT_CATEGORIES:
@@ -749,7 +750,7 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
     rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category))
     if rule is None or rule.currency != txn.currency:
         return
-    # Plain values, as in _check: a lost notification race rolls back and expires the row.
+    # Plain values, as in post_save_check: a lost notification race rolls back and expires the row.
     category, currency = rule.category, rule.currency
     limits = {period: getattr(rule, f"{period}_limit") for period in PERIODS}
     for period in PERIODS:
@@ -775,7 +776,7 @@ async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now:
     plus one best-effort email, as for category limits."""
     if txn.currency != "INR":
         return  # merchant limits are in rupees
-    # Plain values, as in _check: a lost notification race rolls back and expires the rows.
+    # Plain values, as in post_save_check: a lost notification race rolls back and expires the rows.
     rules = [(rule.id, rule.merchant, rule.currency, rule.weekly_limit, rule.monthly_limit)
              for rule in await load_merchant_limits(db, owner.id) if merchants.matches(rule.merchant, txn.merchant)]
     if not rules:
@@ -805,7 +806,8 @@ async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now:
 
 
 async def check_spend_limits(transaction_id: uuid.UUID) -> None:
-    """Background task after a transaction is recorded, edited or categorised. Never raises:
+    """Limits only, for callers that need nothing else: rules.py after a merge or a rule apply. Saving,
+    editing and categorising a payment run every after-save check instead (post_save.run). Never raises:
     alerts must not affect recording."""
     try:
         async with AsyncSessionLocal() as db:
