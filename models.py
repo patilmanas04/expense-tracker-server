@@ -785,3 +785,53 @@ Transaction.duplicate_of = column_property(
     .correlate_except(DuplicateFlag)
     .scalar_subquery()
 )
+
+
+class RecurringDecision(Base):
+    """Your decision about one recurring series (recurring.py): "Not recurring" (dismissed) or "Cancelled".
+    The series themselves are computed on read and never stored."""
+
+    __tablename__ = "recurring_decisions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    merchant_key: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # categorize.merchant_key form: casefolded, spaces collapsed
+    merchant_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )  # SHA-256 of `merchant_key` (merchants.name_hash)
+    cadence: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+    )  # weekly / monthly / yearly
+    status: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+    )  # dismissed / cancelled
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )  # set in Python on every write; a later payment makes a cancelled series active again
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # Unique on the hash, not the key, as merchant_limits: TiDB's collation can't merge two names.
+    __table_args__ = (
+        UniqueConstraint("user_id", "merchant_hash", "cadence", name="uq_recurring_decision"),
+    )

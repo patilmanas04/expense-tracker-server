@@ -24,6 +24,7 @@ import limits
 import low_balance
 import payment_alerts
 import post_save
+import recurring
 import rules
 import settings_store
 from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
@@ -38,6 +39,7 @@ from dashboard import ownership
 post_save.register("limits", limits.post_save_check, {"sms", "manual", "edit", "ai_retry", "restored"})
 post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai_retry", "restored"})
 post_save.register("low_balance", low_balance.check, {"sms", "manual", "restored"})
+post_save.register("recurring", recurring.check_after_save, {"sms", "manual", "edit", "ai_retry", "restored"})
 
 load_dotenv()
 
@@ -83,6 +85,7 @@ app.include_router(notifications_router)
 app.include_router(rules.names_router)
 app.include_router(rules.rules_router)
 app.include_router(settings_store.router)
+app.include_router(recurring.router)
 
 
 @app.middleware("http")

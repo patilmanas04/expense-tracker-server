@@ -239,6 +239,7 @@ One background task, `post_save.run(transaction_id, cause)`, runs every check th
 | `limits` (overall, category and merchant limits) | all five |
 | `payment_alerts` (large or unusual payment) | `sms`, `manual`, `ai_retry`, `restored` (not `edit`: an edit is your own change) |
 | `low_balance` (Balance left dropped below your level) | `sms`, `manual`, `restored` (only "Not a duplicate"; a row released by deleting its original doesn't alert) |
+| `recurring` (a new recurring payment, or its price changed) | all five (only the newest payment of a series notifies, so an edit to an older one or a late SMS doesn't) |
 
 A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
 
@@ -275,6 +276,35 @@ One notification per payment (`kind = "low_balance"`, dedupe key `low_balance:<i
 - body "Below your ₹10,000 alert (HDFC and ICICI together)." (the level, whole rupees).
 
 Queries: none when Off or for a credit, 1 without a saved balance, 2 normally (the saved balance, then the sum), 1 more for "Not a duplicate", plus the notification's own 2 when it alerts.
+
+## Recurring payments
+
+`recurring.py` finds payments that repeat every week, month or year (subscriptions, EMIs, rent, SIPs) in your own history. Nothing about a series is stored: every read works it out from the payments, so deletes, merges and "Not a duplicate" show at once.
+
+- **What counts:** your parsed INR debits (unassigned SMS rows included; hand-added cash too), not Credit Card Payment or Self Transfer, not a possible duplicate waiting for your decision. Investments & Finance **does** count (SIPs recur), so this is not the "What counts as spending" rule. Payments are grouped by `categorize.merchant_key` (case and extra spaces ignored; no name or "Unknown" never groups) and dated by their IST day.
+- **Window: the last 855 days** (2 × 380 + 95), not the design's 400. With 400 a yearly pair would only be found for about 35 days after each renewal; 855 keeps it listed through its renewal and its "late?" grace, and it drops off once its older payment leaves the window.
+- **Cadence** comes from the newest gap: 5–9 days weekly, 26–35 monthly, 350–380 yearly. 10–18 and 52–70 days are one missed week or month. Any other gap, including 0 (two payments on one day), gives no series until the next payment.
+- **The run** walks back from the newest payment while each gap fits the cadence, allowing one missed week or month per run (none for yearly). It **forms a series** when some 3 consecutive run payments (2 for yearly) are all within **±15%** of their median.
+- **Period** = the median of the run's gaps (a missed gap counts as two halves), rounded down to whole days; **next expected** = last payment + period (a 28-day plan stays on 28 days).
+- **Amount** is the newest payment's. **"Was"** (`previous_amount`) is the payment before it, only while the two differ by more than **both 5% and ₹10**.
+- **Late** once today (IST) is after next expected + period ÷ 4 (whole days); **stopped** (not returned) once today is after last payment + 2 × period + period ÷ 4.
+
+Your decisions live in `recurring_decisions` (added by `create_all`): one row per merchant key and cadence, unique on a SHA-256 of the key (`uq_recurring_decision`, like `merchant_limits`), with `status` `dismissed` or `cancelled` and `decided_at`. "Not recurring" (dismissed) moves the series to `hidden`. "Cancelled" holds while its last payment is on or before the decision's IST day; a later payment makes it active again (the row stays). A decision with no current series is ignored.
+
+```http
+GET  /api/v1/recurring                   -> {"currency": "INR", "monthly_total": "24067.00", "items": [...], "hidden": [...]}
+PUT  /api/v1/recurring/decisions         {"merchant_key": "netflix", "cadence": "monthly", "status": "dismissed" | "cancelled"}  -> 204
+POST /api/v1/recurring/decisions/clear   {"merchant_key": "netflix", "cadence": "monthly"}                                         -> 204
+```
+
+Each series: `merchant_key`, `name` (the newest payment's, spaces collapsed), `cadence`, `amount` and `previous_amount` (2-decimal strings), `payments`, `first_date`, `last_date`, `next_expected`, `late`, `status`. `items` lists active series (late first, then by next date, then name) followed by cancelled ones (by name); `hidden` the dismissed ones. `monthly_total` adds active series only (weekly × 52 ÷ 12, monthly × 1, yearly ÷ 12), exactly, then rounds half up to whole rupees. The writes need the session and the app's `Origin` (403 "Invalid request origin."); the key is normalised like `merchant_key`, and an empty key or "Unknown" (422 "Enter a merchant name."), invalid characters or more than 255 characters, or a cadence or status outside the lists gives 422. A write replaces the one decision for that merchant and cadence; clearing one that isn't there is still 204. No 404 or 409.
+
+Notifications (in-app, linking to `/report/recurring`), from the `recurring` post-save check, only when the saved payment is the newest of its series and never for a dismissed merchant and cadence:
+
+- **New** (`kind = "recurring_new"`, dedupe key `recurring_new:<cadence>:<sha256 of the key>`): the series wouldn't exist with that cadence without this payment, so subscriptions you've had for months send nothing when this ships. "New recurring payment: Spotify" / "₹119 a month, next around 20 Nov". Once per merchant and cadence, ever.
+- **Price** (`kind = "recurring_price"`, dedupe key `recurring_price:<transaction id>`): "was" is set and the two payments before the newest were within 5% of each other. "Netflix went up: ₹649" / "Was ₹499. Next around 13 Dec." ("went down" for a drop). A bill that varies (electricity) sends none.
+
+Money in these texts drops a trailing ".00" ("₹649", "₹10,688.10"); names over 120 characters are cut with "…".
 
 ## Spend limits, notifications and (optional) email alerts
 
@@ -335,6 +365,8 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | SMS webhook | +1 for your merged name and category rules (one statement); a rule that sets the category also saves the Gemini call |
 | `POST /api/v1/transactions` (adding by hand) | +1 for your merged name and category rules (one statement) |
 | After-save checks (background, after the reply) | 4 for the runner (owner, transaction, held-out test, settings), then the limit checks as above, then up to 1 for a payment alert's merchant history |
+| `GET /api/v1/recurring` | 2 after the session: your debits in the window (4 columns), then your decisions |
+| Recurring check after a debit (background) | 1 (your debits in the window), +1 for decisions when the payment is the newest of a series, +2 for a notification |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.
 

@@ -22,6 +22,7 @@ from sqlalchemy import event, select, text
 import limits
 import main
 import post_save
+import recurring
 import settings_store
 from auth import current_user
 from database import AsyncSessionLocal, Base, engine
@@ -140,8 +141,10 @@ class RegisterTests(unittest.TestCase):
             ("limits", ALL_CAUSES),
             ("payment_alerts", ALL_CAUSES - {"edit"}),
             ("low_balance", {"sms", "manual", "restored"}),
+            ("recurring", ALL_CAUSES),
         ])
         self.assertIs(post_save._CHECKS[0][1], limits.post_save_check)
+        self.assertIs(post_save._CHECKS[3][1], recurring.check_after_save)
         self.assertEqual(post_save.CAUSES, ("sms", "manual", "edit", "ai_retry", "restored"))
 
 
