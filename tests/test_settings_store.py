@@ -26,7 +26,8 @@ from main import app
 from models import User, UserSetting
 
 ORIGIN = {"Origin": "http://localhost:3000"}
-DEFAULTS = {"alerts.large_amount": None, "alerts.unusual": True, "limits.warn_percent": 80}
+DEFAULTS = {"alerts.large_amount": None, "alerts.unusual": True, "limits.warn_percent": 80,
+            "alerts.low_balance": None}
 AMOUNT_ERROR = "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."
 UNUSUAL_ERROR = "alerts.unusual: Choose on or off."
 
@@ -106,7 +107,8 @@ class DefaultsTests(SettingsTestCase):
     async def test_partial_put_keeps_the_other_key(self):
         await self.put({"alerts.large_amount": 5000})
         data = await self.put({"alerts.unusual": False})
-        self.assertEqual(data, {"alerts.large_amount": 5000, "alerts.unusual": False, "limits.warn_percent": 80})
+        self.assertEqual(data, {"alerts.large_amount": 5000, "alerts.unusual": False, "limits.warn_percent": 80,
+                                "alerts.low_balance": None})
         self.assertEqual(list(data), list(settings_store.KEYS))
         self.assertEqual(await self.get(), data)
 
@@ -221,7 +223,8 @@ class StoredValueTests(SettingsTestCase):
                          [("alerts.large_amount", "100"), ("alerts.unusual", "false")])
         async with AsyncSessionLocal() as db:
             self.assertEqual(await settings_store.load(db, self.other.id),
-                             {"alerts.large_amount": 100, "alerts.unusual": False, "limits.warn_percent": 80})
+                             {"alerts.large_amount": 100, "alerts.unusual": False, "limits.warn_percent": 80,
+                              "alerts.low_balance": None})
 
 
 class RaceAndTableTests(SettingsTestCase):

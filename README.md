@@ -199,9 +199,10 @@ All need the dashboard session; writes (the preview included) also need the dash
 **Settings → Alerts** in the app. Every setting is one row in `settings_store.KEYS` (its default and its validation), stored as JSON text in `user_settings` (one row per setting, added by `create_all`), so a new setting needs no new column.
 
 ```http
-GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80}   (every key, always in this order)
+GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80, "alerts.low_balance": null}   (every key, always in this order)
 PUT /api/v1/settings   {"alerts.large_amount": 5000}   -> the full object after saving
 PUT /api/v1/settings   {"limits.warn_percent": null}   -> warnings Off
+PUT /api/v1/settings   {"alerts.low_balance": 10000}   -> alert when Balance left drops below ₹10,000
 ```
 
 | Key | Value | Default |
@@ -209,13 +210,15 @@ PUT /api/v1/settings   {"limits.warn_percent": null}   -> warnings Off
 | `alerts.large_amount` | whole rupees, 1 to 1,00,00,000, or `null` (Off) | `null` (Off) |
 | `alerts.unusual` | `true` / `false` | `true` |
 | `limits.warn_percent` | the near-limit warning level: 50 to 95 in steps of 5, or `null` (Off) | `80` |
+| `alerts.low_balance` | the low-balance level: whole rupees, 1 to 10,00,00,000, or `null` (Off); the app shows it under Settings → Bank balance | `null` (Off) |
 
 Both need the dashboard session (401 "Please sign in…" without it); `PUT` also needs the dashboard `Origin` (403 "Invalid request origin."). `PUT` is partial: it changes only the keys given, and `{}` changes nothing. Validation is strict JSON typing: an amount must be a JSON integer (`5000.0` is taken as `5000`); `true`, `"5000"` and `5000.5` are rejected, and `alerts.unusual` takes only `true` or `false`. Every key is checked before anything is written, so a 422 writes nothing; it names the first bad key in the body's order:
 
 - `{"detail": "Unknown setting: <key>"}` (the key cut to 64 characters),
 - `{"detail": "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."}`,
 - `{"detail": "alerts.unusual: Choose on or off."}`,
-- `{"detail": "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."}` (45, 82, 100, 0, 50.5, `true`, `"80"`; `80.0` is taken as `80`).
+- `{"detail": "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."}` (45, 82, 100, 0, 50.5, `true`, `"80"`; `80.0` is taken as `80`),
+- `{"detail": "alerts.low_balance: Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off."}` (0, 100000001, `true`, `"5000"`, 5000.5; `5000.0` is taken as `5000`).
 
 A body that isn't a JSON object gets FastAPI's own 422 (a list `detail`). A missing row means the default; a stored `null` is a value (for `alerts.large_amount`, Off). A stored value that no longer passes its key's rules is logged and read as the default. Two first saves of the same key at once end with one row (the loser's commit fails and it updates the winner's row). `KEY` is a reserved word in MySQL/TiDB: SQLAlchemy quotes it, and no raw SQL may use this table.
 
@@ -235,6 +238,7 @@ One background task, `post_save.run(transaction_id, cause)`, runs every check th
 | --- | --- |
 | `limits` (overall, category and merchant limits) | all five |
 | `payment_alerts` (large or unusual payment) | `sms`, `manual`, `ai_retry`, `restored` (not `edit`: an edit is your own change) |
+| `low_balance` (Balance left dropped below your level) | `sms`, `manual`, `restored` (only "Not a duplicate"; a row released by deleting its original doesn't alert) |
 
 A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
 
@@ -255,6 +259,22 @@ One notification per payment (`kind = "payment_alert"`, dedupe key `payment_aler
 - unusual (alone or with large): "₹3,200.00 at Swiggy — about 9× what you usually spend there (₹350.00)" (the multiple rounded half up).
 
 Skipped: credits, other currencies, payments that need review, categories that aren't spending (Credit Card Payment, Self Transfer, Investments & Finance), and possible duplicates until you decide (after "Not a duplicate" the payment is checked then). Edits never alert. The check reads at most one query (the merchant's history), and none when the unusual rule is off, the payment is under ₹500 or has no merchant name.
+
+## Low-balance alert
+
+**Alert me below** in **Settings → Bank balance** (`alerts.low_balance`, whole rupees, Off by default): one in-app notification when a payment takes Balance left (Bank balance; HDFC and ICICI together) from at or above the level to below it. `low_balance.py` keeps no state. After each saved payment it works out `current` (Balance left now, `balance.summarize`) and `before = current + amount`, and alerts when `before ≥ level > current`:
+
+- **Once per dip.** Later payments while the balance stays below start below the level, so they can't cross it. Landing exactly on the level is not below it.
+- **Re-arms by itself.** Once a credit or a newly saved balance lifts Balance left back to the level or above, the next payment that crosses it alerts again.
+- **Never alerts** for credits, cash entries, credit-card spends (a card bill paid from the bank account does count), possible duplicates waiting for your decision, payments that need review, other currencies (and nothing at all when the saved balance isn't in INR), payments at or before the saved balance's `as_of` (they're already in it), edits, AI category retries, deletes, saving a balance or changing the level. "Not a duplicate" on a debit is checked like a new payment. A held-out row that counts again because you deleted its original isn't: the balance didn't move.
+- **Known limit:** two SMS saved at the same moment are both checked after both are saved, so each sees the final balance. Only a payment whose own amount spans the level alerts, and if neither does, nothing alerts until the next payment.
+
+One notification per payment (`kind = "low_balance"`, dedupe key `low_balance:<id>`), in-app only (never emailed), linking to `/settings/balance` (the breakdown):
+
+- title "Balance low: ₹9,200.00 left" (the money format of every other notification; below zero, "Balance low: -₹500.00 left"),
+- body "Below your ₹10,000 alert (HDFC and ICICI together)." (the level, whole rupees).
+
+Queries: none when Off or for a credit, 1 without a saved balance, 2 normally (the saved balance, then the sum), 1 more for "Not a duplicate", plus the notification's own 2 when it alerts.
 
 ## Spend limits, notifications and (optional) email alerts
 

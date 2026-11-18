@@ -97,6 +97,11 @@ KEYS: dict[str, Key] = {
         50, 95, step=5, nullable=True,
         message="Choose 50% to 95% in steps of 5, or Off.",
     )),
+    # Whole rupees; one notification when a payment takes Balance left below this (low_balance.py). null = Off.
+    "alerts.low_balance": Key(None, whole_number(
+        1, 100_000_000, nullable=True,
+        message="Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off.",
+    )),
 }
 
 

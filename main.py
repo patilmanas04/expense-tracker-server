@@ -21,6 +21,7 @@ from models import Transaction, User
 import categorize
 import duplicates
 import limits
+import low_balance
 import payment_alerts
 import post_save
 import rules
@@ -36,6 +37,7 @@ from dashboard import ownership
 # After-save checks (post_save.py), in the order they run. Later designs add their line here.
 post_save.register("limits", limits.post_save_check, {"sms", "manual", "edit", "ai_retry", "restored"})
 post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai_retry", "restored"})
+post_save.register("low_balance", low_balance.check, {"sms", "manual", "restored"})
 
 load_dotenv()
 

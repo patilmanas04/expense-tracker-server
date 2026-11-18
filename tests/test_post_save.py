@@ -139,6 +139,7 @@ class RegisterTests(unittest.TestCase):
         self.assertEqual([(name, set(causes)) for name, _, causes in post_save._CHECKS], [
             ("limits", ALL_CAUSES),
             ("payment_alerts", ALL_CAUSES - {"edit"}),
+            ("low_balance", {"sms", "manual", "restored"}),
         ])
         self.assertIs(post_save._CHECKS[0][1], limits.post_save_check)
         self.assertEqual(post_save.CAUSES, ("sms", "manual", "edit", "ai_retry", "restored"))
@@ -165,7 +166,8 @@ class RunnerTests(PostSaveTestCase):
         post_save.register("b", recorder("b"), {"manual"})
         post_save.register("c", recorder("c"), {"edit"})
         await post_save.run(txn_id, "edit")
-        settings = {"alerts.large_amount": None, "alerts.unusual": False, "limits.warn_percent": 80}
+        settings = {"alerts.large_amount": None, "alerts.unusual": False, "limits.warn_percent": 80,
+                    "alerts.low_balance": None}
         self.assertEqual(seen, [("a", "edit", txn_id, "owner@example.com", settings),
                                 ("c", "edit", txn_id, "owner@example.com", settings)])
         seen.clear()
