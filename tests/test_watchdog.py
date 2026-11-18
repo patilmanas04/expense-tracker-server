@@ -426,9 +426,9 @@ class EndToEndTests(WatchdogTestCase):
         headers = {"X-Jobs-Secret": "test-jobs-secret"}
         with patch.dict(os.environ, {"JOBS_SECRET": "test-jobs-secret"}), patch.object(jobs, "now", return_value=NOW):
             response = await client.post("/api/v1/jobs/daily", params={"force": "true"}, headers=headers)
-            self.assertEqual((response.status_code, response.json()), (200, {"ran": ["watchdog"]}))
+            self.assertEqual((response.status_code, response.json()), (200, {"ran": ["watchdog", "upcoming_reminders"]}))
             again = await client.post("/api/v1/jobs/daily", params={"force": "true"}, headers=headers)
-            self.assertEqual(again.json(), {"ran": ["watchdog"]})
+            self.assertEqual(again.json(), {"ran": ["watchdog", "upcoming_reminders"]})
         inbox = (await client.get("/api/v1/notifications")).json()
         self.assertEqual([(n["kind"], n["title"], n["link"], n["actions"]) for n in inbox["items"]], [
             ("watchdog", "No bank SMS for 5 days — check your iPhone Shortcut", "/settings#alerts", []),

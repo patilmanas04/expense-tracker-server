@@ -60,7 +60,7 @@ X-Webhook-Secret: YOUR_EXISTING_WEBHOOK_SECRET
 }
 ```
 
-Create a Message automation for your bank sender, then **Get Contents of URL**, POST, JSON body. Put the message variable in `message`, not the literal text "Shortcut Input". Set the secret header. `sender` and `received_at` are optional; any supplied date must be ISO 8601 with a timezone. Manual Play testing needs a Text action containing sample SMS text. `Authorization: Bearer ...` remains supported.
+Create a Message automation for your bank sender, then **Get Contents of URL**, POST, JSON body. Put the message variable in `message`, not the literal text "Shortcut Input". Set the secret header. `sender` and `received_at` are optional; any supplied date must be ISO 8601 with a timezone. Manual Play testing needs a Text action containing sample SMS text. `Authorization: Bearer ...` remains supported. The automation must forward **every** SMS from the bank sender, with no keyword filter: auto-debit notices and card bills (see Upcoming payments) don't contain "debited" or "credited", so a filtered automation never sends them.
 
 `success`, `duplicate`, and `ignored` responses use HTTP 200. When the SMS looks like a second record of an earlier transaction (see Possible duplicates), the status is still `success` and the message reads "Transaction logged successfully via regex (possible duplicate: held out of totals)", so the Shortcut can show why Balance left didn't move. Unknown formats are preserved with `is_parsed=false`, marked for review and excluded from totals. Analytics separate currencies, calculate amounts using Decimal, and use Asia/Kolkata dates. Net cash flow is income minus expenses for the selected period, not an account balance. Table filters do not alter period charts/totals. There is no export endpoint: the app's Activity screen exports the transactions it shows as a CSV file.
 
@@ -340,6 +340,37 @@ Notifications (in-app, linking to `/report/recurring`), from the `recurring` pos
 
 Money in these texts drops a trailing ".00" ("₹649", "₹10,688.10"); names over 120 characters are cut with "…".
 
+## Upcoming payments
+
+`upcoming.py` lists what is about to leave your accounts in the next days, worked out on every read (nothing about paid or missed is stored), from three kinds:
+
+- **Auto-debit** (`auto_debit`): a bank's pre-debit notice for a mandate or AutoPay ("AutoPay for NETFLIX, debit of Rs 649.00 is scheduled on …").
+- **Card bill** (`card_bill`): a credit-card statement or bill reminder, with its total and minimum due.
+- **Expected** (`expected`): an active recurring series (see Recurring payments) whose next payment falls in the range, late ones included at their past date.
+
+Notices are stored in `upcoming_payments` (added by `create_all`; no `user_id`, every row is the owner's like unassigned SMS rows; unique on `notice_key`, `uq_upcoming_notice`). **Storing them waits for real HDFC and ICICI notice samples** (BUILD_ORDER step 21): until then the webhook still ignores notices (see Webhook review), the table stays empty, every read works with no rows, and the list shows the payments expected from your recurring series.
+
+- **Merge:** an expected item is left out when an auto-debit notice, dismissed or not, shares a meaningful word with the series name (`merchants.share_word`: 3+ characters with a letter, case ignored, common words such as "bank", "hdfc", "upi", "autopay" ignored) and is due within 7 days of the expected date. The notice has the real amount and date (a price rise shows at its new price).
+- **Paid** (payments are your parsed INR rows, unassigned SMS included, not a possible duplicate waiting for your decision; hand-added and edited ones count at once, deleted ones stop counting):
+  - auto-debit: a debit dated from 2 days before to 5 days after the due date (IST), within ±1% of the amount, sharing a word with the payee (the merchant or the SMS text);
+  - card bill: the card's own "payment received" credits (category Credit Card Payment, the same `account_ref` compared without case or extra spaces, dated on or after the day the notice arrived) add up to the minimum due, or the total when there is no minimum. The bank-side "towards … Credit Card" debit is not used: its account is the bank's.
+- **No payment seen** (`not_seen`): not paid and today is more than 5 days after an auto-debit's due date, or after a card bill's due date. Otherwise `upcoming`; an expected item is `late` when its series is late.
+- **Listed:** notices not dismissed and due from 7 days ago up to the end of the range, plus the expected items; sorted by date, then card bills, auto-debits, expected, then payee (case ignored).
+- **Dismiss** hides a notice for good (`dismissed_at`); expected items are hidden from Recurring payments instead ("Not recurring").
+
+```http
+GET  /api/v1/upcoming?days=30          -> {"currency": "INR", "items": [...]}   (days 1–62, default 30, today included)
+POST /api/v1/upcoming/{id}/dismiss     -> 204   (also when already dismissed)
+```
+
+Each item: `id` (null for expected items), `kind`, `payee`, `account_ref` (null for expected items), `amount` and `min_amount` (2-decimal strings; `min_amount` only for card bills that give one), `date` (the due date, or the expected date), `status` (`upcoming`, `paid`, `not_seen`, `late`), `paid_amount` and `leaves_bank`. There is no total: the app adds up the range it shows. Both routes need the owner session (401); dismiss also needs the app's `Origin` (403 "Invalid request origin."), a UUID id (422) and an existing notice (404 "Upcoming payment not found."). `days` outside 1–62 is 422.
+
+For Safe to spend: `paid_amount` is the sum of the matching card-payment credits for a card bill (whether or not it reaches the minimum), so what is still owed is `amount − paid_amount`; it is "0.00" for the other kinds. `leaves_bank` is true for card bills, for auto-debits unless the notice is about a credit card (`balance.affects_bank_balance`), and for expected items when their series' newest payment came from the bank (not a card spend and not Cash).
+
+The rules are written and tested against HDFC and ICICI wording only; other banks' notices may not be recognised.
+
+Tests: `tests/test_upcoming.py` (the paid and not-seen rules at their edges, the list, merge, `leaves_bank`, order and statement counts, the API and dismiss, the reminder).
+
 ## Daily jobs and the SMS watchdog
 
 Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it stops (an iOS update, a revoked permission, a changed Shortcut), Folio simply receives nothing. A daily check run by the server itself warns you.
@@ -349,7 +380,7 @@ Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it 
 - **When:** once a day at **21:00 IST**, inside the server process (an `asyncio` task started at start-up and cancelled at shutdown). **120 seconds after start-up** it also runs a catch-up, so a server that was down or asleep at 21:00 catches up (the delay lets an SMS that woke a sleeping host be saved first).
 - **Due:** a job is due when it hasn't run since the most recent 21:00 IST. The scheduler, the catch-up and the external trigger all use that one rule.
 - **Claim:** before a job runs, its row in `job_runs` (`name` primary key, `last_run`; created by `create_all`, runner state with no owner) is updated only if `last_run` is before that 21:00 (or inserted on the first run; a unique-key clash means another worker won). So several workers, a restart or a cron added later never run a job twice in one slot. A job that fails after its claim is logged and waits for the next day.
-- **Jobs** are registered in one block in `main.py` (`jobs.register("watchdog", watchdog.daily)`) and run in that order, each in its own session, with the owner (`DASHBOARD_OWNER_EMAIL`; none configured or not signed up yet → nothing runs) and today's IST date.
+- **Jobs** are registered in one block in `main.py` (`jobs.register("watchdog", watchdog.daily)`, then `jobs.register("upcoming_reminders", upcoming.daily)`) and run in that order, each in its own session, with the owner (`DASHBOARD_OWNER_EMAIL`; none configured or not signed up yet → nothing runs) and today's IST date.
 
 **External trigger.** If your host sleeps when idle, the in-process timer never fires. Set `JOBS_SECRET` in `.env` (a long random string, different from `WEBHOOK_SECRET`) and have a free cron service, or the host's cron, call this daily at **21:05 IST (15:35 UTC)**:
 
@@ -358,7 +389,7 @@ curl -fsS -X POST -H "X-Jobs-Secret: $JOBS_SECRET" https://<your-server>/api/v1/
 ```
 
 ```http
-POST /api/v1/jobs/daily              -> 200 {"ran": ["watchdog"]}   (the jobs that completed in this call; [] when nothing was due)
+POST /api/v1/jobs/daily              -> 200 {"ran": ["watchdog", "upcoming_reminders"]}   (the jobs that completed in this call; [] when nothing was due)
 POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already ran since 21:00 IST
 ```
 
@@ -367,6 +398,10 @@ POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already r
 - Other methods get 405. No session, no `Origin` check and no body; `X-Jobs-Secret` is not in the CORS headers (server to server only).
 
 **Never give a cron service the webhook secret**: anyone holding it can post fake bank SMS. A leaked jobs secret can only run the daily check.
+
+### Card-bill reminder (`upcoming_reminders`)
+
+`upcoming.daily` reads the upcoming list for today and tomorrow and, for each card bill still `upcoming` (not paid, not dismissed) due today or tomorrow, adds one bell notification: `kind = "card_bill_due"`, "HDFC card XX9012 bill due tomorrow" ("… due today" on the due date) / "₹4,500 due on 5 Dec (minimum ₹500). No payment seen yet." (no "(minimum …)" when the bill gives none), link `/upcoming`, dedupe key `card_bill_due:<notice id>`. The 21:00 run normally sends it the evening before; if that run is missed, the catch-up or the due-date run sends it. **Once per bill**, and never emailed. A failure is logged and rolled back, and the job still counts as run. Until notices are stored (see Upcoming payments) it finds no card bills and creates nothing.
 
 ### The SMS watchdog (`watchdog.py`)
 
@@ -392,7 +427,7 @@ All are `kind = "watchdog"`, no buttons. **Once per episode:** the dedupe key na
 
 **Email:** a warning is also emailed only when it was newly created, `watchdog.email` is on and Gmail is configured (see Spend limits, notifications and email alerts): to `ALERT_EMAIL_TO` (or the owner), subject = the title, text = the body plus "Open Folio: Settings → Alerts.". If Gmail refuses it, the error is logged and one bell notification per day says "Email alerts aren't being sent" ("Gmail refused the last email. Run scripts/gmail_authorize.py again (see the server README).", key `watchdog:email-failed:{today}`). While the OAuth app is in *Testing*, Google expires the refresh token every 7 days, so email would stop silently; publish the app (see [Optional: get the Gmail OAuth credentials](#optional-get-the-gmail-oauth-credentials-one-time), step 3).
 
-Tests: `tests/test_jobs.py` (the slot, the claim, races, failures, the scheduler, the lifespan task and the trigger), `tests/test_watchdog.py` (each check at its threshold, once per episode, settings, statement counts, email mocked, the trigger end to end) and `tests/test_pay_periods.py` (`UsualPaydayTests`).
+Tests: `tests/test_jobs.py` (the slot, the claim, races, failures, the scheduler, the lifespan task and the trigger), `tests/test_watchdog.py` (each check at its threshold, once per episode, settings, statement counts, email mocked, the trigger end to end), `tests/test_upcoming.py` (`ReminderTests`: the card-bill reminder) and `tests/test_pay_periods.py` (`UsualPaydayTests`).
 
 ## Spend limits, notifications and (optional) email alerts
 
@@ -454,6 +489,8 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | `POST /api/v1/transactions` (adding by hand) | +1 for your merged name and category rules (one statement) |
 | After-save checks (background, after the reply) | 4 for the runner (owner, transaction, held-out test, settings), then the limit checks as above, then up to 1 for a payment alert's merchant history |
 | `GET /api/v1/recurring` | 2 after the session: your debits in the window (4 columns), then your decisions |
+| `GET /api/v1/upcoming` | 3–5: notices, then your payments since the earliest open notice (only when one is open), recurring's 2, then the newest payment of each expected series (only when one is listed) |
+| Card-bill reminder (daily job) | the same 3–5, +2 per new notification |
 | Recurring check after a debit (background) | 1 (your debits in the window), +1 for decisions when the payment is the newest of a series, +2 for a notification |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.

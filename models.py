@@ -851,3 +851,63 @@ class JobRun(Base):
         DateTime(timezone=True),
         nullable=False,
     )  # UTC, set in Python by jobs._claim
+
+
+class UpcomingPayment(Base):
+    """A payment the bank said is coming (an auto-debit pre-debit notice or a card bill), stored from an ignored
+    SMS (upcoming.py). No user_id: notices arrive through the webhook, so every row is the owner's, like
+    unassigned SMS transactions. Paid / "No payment seen" are computed on read, never stored."""
+
+    __tablename__ = "upcoming_payments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    kind: Mapped[str] = mapped_column(
+        String(12),
+        nullable=False,
+    )  # auto_debit / card_bill
+    payee: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # "Netflix", "HDFC card XX9012"
+    account_ref: Mapped[Optional[str]] = mapped_column(
+        String(100),
+        nullable=True,
+    )  # as Transaction.account_ref: "HDFC XX9012"
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+    )  # the amount due (a card bill's total)
+    min_amount: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+    )  # a card bill's minimum due
+    due_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+        index=True,
+    )  # IST calendar date
+    notice_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )  # SHA-256 of "<kind>|<ref>|<due ISO>": a repeated reminder SMS stores nothing new
+    raw_message: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )  # when the notice was received
+    dismissed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  # swiped away on /upcoming
+
+    __table_args__ = (
+        UniqueConstraint("notice_key", name="uq_upcoming_notice"),
+    )

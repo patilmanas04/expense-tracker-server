@@ -30,6 +30,7 @@ import post_save
 import recurring
 import rules
 import settings_store
+import upcoming
 import watchdog
 from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
                     detect_category, parse_sms)
@@ -48,6 +49,7 @@ post_save.register("recurring", recurring.check_after_save, {"sms", "manual", "e
 
 # Daily jobs (jobs.py), run once a day at 21:00 IST in this order. Later designs add their line here.
 jobs.register("watchdog", watchdog.daily)
+jobs.register("upcoming_reminders", upcoming.daily)
 
 load_dotenv()
 
@@ -100,6 +102,7 @@ app.include_router(rules.names_router)
 app.include_router(rules.rules_router)
 app.include_router(settings_store.router)
 app.include_router(recurring.router)
+app.include_router(upcoming.router)
 
 
 @app.middleware("http")
