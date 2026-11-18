@@ -319,9 +319,10 @@ class SettingTests(LowBalanceTestCase):
     async def test_setting_validation(self):
         response = await self.client.get("/api/v1/settings")
         self.assertEqual(response.json(), {"alerts.large_amount": None, "alerts.unusual": True,
-                                           "limits.warn_percent": 80, "alerts.low_balance": None})
+                                           "limits.warn_percent": 80, "alerts.low_balance": None,
+                                           "periods.payday": False})
         self.assertEqual(list(response.json()), ["alerts.large_amount", "alerts.unusual", "limits.warn_percent",
-                                                 "alerts.low_balance"])
+                                                 "alerts.low_balance", "periods.payday"])
         for value in (0, 100000001, True, False, "5000", 5000.5, -1, [5000], {"rupees": 5000}):
             with self.subTest(value=value):
                 response = await self.client.put("/api/v1/settings", json={"alerts.low_balance": value},
@@ -333,7 +334,7 @@ class SettingTests(LowBalanceTestCase):
             with self.subTest(value=value):
                 data = await self.level(value)
                 self.assertEqual(list(data), ["alerts.large_amount", "alerts.unusual", "limits.warn_percent",
-                                              "alerts.low_balance"])
+                                              "alerts.low_balance", "periods.payday"])
                 self.assertEqual(data["alerts.low_balance"], expected)
                 self.assertIs(type(data["alerts.low_balance"]), type(expected))
         self.assertEqual(await self.stored(), [("alerts.low_balance", "10000")])

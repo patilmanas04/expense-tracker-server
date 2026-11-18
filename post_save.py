@@ -19,9 +19,9 @@ Registration lives in one block in main.py, right after the imports, so the orde
 Each check runs in its own try/except: one failing never stops the others, and run() never raises.
 
 Cost after all designs ship, per saved SMS, after the reply is sent and one check at a time: the runner's 4
-queries (owner, transaction, held-out test, settings), limits 6–8, payment alerts 1, low balance 2, recurring
-about 5, refunds 1–2 for credits, transfers 1–2 for parsed SMS: about 20 round trips, 4–6 s on TiDB, which
-nothing waits for. A restart drops queued tasks, as with any background task.
+queries (owner, transaction, held-out test, settings), limits 6–8 (one more with 'Month starts on payday' on),
+payment alerts 1, low balance 2, recurring about 5, refunds 1–2 for credits, transfers 1–2 for parsed SMS: about
+20 round trips, 4–6 s on TiDB, which nothing waits for. A restart drops queued tasks, as with any background task.
 """
 import logging
 import uuid

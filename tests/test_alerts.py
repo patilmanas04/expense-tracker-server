@@ -28,10 +28,11 @@ from sqlalchemy import event, select
 
 import limits
 import mailer
+import settings_store
 from auth import current_user
 from database import AsyncSessionLocal, Base, engine
 from main import app
-from models import SpendAlert, Transaction, User
+from models import Notification, SpendAlert, Transaction, User
 from scripts import gmail_authorize
 
 GMAIL_ENV = {
@@ -154,7 +155,9 @@ class PeriodAndFormatTests(unittest.TestCase):
         self.assertEqual(limits.format_money(Decimal("999"), "INR"), "₹999.00")
 
 
-class LimitsApiTests(GoogleTestCase):
+class LimitsTestCase(GoogleTestCase):
+    """Setup and helpers shared by the limit tests below; no tests of its own."""
+
     async def asyncSetUp(self):
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.drop_all)
@@ -205,6 +208,8 @@ class LimitsApiTests(GoogleTestCase):
         async with AsyncSessionLocal() as db:
             return (await db.scalars(select(SpendAlert).order_by(SpendAlert.created_at))).all()
 
+
+class LimitsApiTests(LimitsTestCase):
     async def test_requires_login_and_same_origin(self):
         self.assertEqual((await self.client.get("/api/v1/limits")).status_code, 401)
         self.sign_in()
@@ -336,8 +341,8 @@ class LimitsApiTests(GoogleTestCase):
                 summary = await limits.summarize(db, self.owner, rules)
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", record)
-        # One query for the limits you've set, one for every meter, however many categories.
-        self.assertEqual(len(statements), 2, statements)
+        # The limits you've set, the pay-period setting, every meter: however many categories.
+        self.assertEqual(len(statements), 3, statements)
         self.assertEqual((summary.weekly.spent, summary.monthly.spent), (900, 900))
         self.assertTrue(summary.weekly.alerted and summary.monthly.alerted)
         self.assertIn("Backend Error", summary.email.last_error)
@@ -472,6 +477,176 @@ class LimitsApiTests(GoogleTestCase):
             missing = await self.client.post("/api/v1/limits/test-email", headers=ORIGIN)
         self.assertEqual(missing.status_code, 503)
         self.assertIn("GMAIL_REFRESH_TOKEN", missing.json()["detail"])
+
+
+# Tuesday 10 Nov 2026, 12:00 IST: with a salary on 31 Oct, the pay period runs 31 Oct – 29 Nov (expected last day).
+PAY_NOW = datetime(2026, 11, 10, 6, 30, tzinfo=timezone.utc)
+
+
+def at_noon(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, 12, 0, tzinfo=IST)
+
+
+def ist_start(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, tzinfo=IST).astimezone(timezone.utc)
+
+
+class PaydayLimitTests(LimitsTestCase):
+    """Monthly limits follow pay periods when 'Month starts on payday' is on (pay_periods.py)."""
+
+    async def salary(self, day: date):
+        """A parsed INR Salary credit for the owner at 10:00 IST, stored in UTC."""
+        await self.row("CREDIT", 50000, datetime(day.year, day.month, day.day, 10, 0, tzinfo=IST), category="Salary")
+
+    async def row(self, kind, amount, when, category="Shopping"):
+        self.counter += 1
+        async with AsyncSessionLocal() as db:
+            db.add(Transaction(type=kind, amount=Decimal(str(amount)), currency="INR", category=category, is_parsed=True,
+                               user_id=self.owner.id, raw_message="fixture", message_hash=f"payday-{self.counter}",
+                               transaction_time=when.astimezone(timezone.utc)))
+            await db.commit()
+
+    async def payday_on(self):
+        async with AsyncSessionLocal() as db:
+            await settings_store.save(db, self.owner.id, {"periods.payday": True})
+
+    async def limit_notifications(self) -> list[Notification]:
+        async with AsyncSessionLocal() as db:
+            return list(await db.scalars(select(Notification).where(Notification.kind == "spend_limit")
+                                         .order_by(Notification.created_at)))
+
+    async def windows(self, now=PAY_NOW, payday=None):
+        statements = []
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        async with AsyncSessionLocal() as db:
+            event.listen(engine.sync_engine, "before_cursor_execute", record)
+            try:
+                windows = await limits.current_windows(db, self.owner, now, payday)
+            finally:
+                event.remove(engine.sync_engine, "before_cursor_execute", record)
+        return windows, len(statements)
+
+    async def test_off_is_unchanged(self):
+        self.sign_in()
+        await self.salary(date(2026, 9, 30))
+        data = (await self.client.get("/api/v1/limits")).json()
+        self.assertEqual((data["monthly"]["start"], data["monthly"]["end"]), ("2026-10-01", "2026-10-31"))
+        self.assertEqual((data["weekly"]["start"], data["weekly"]["end"]), ("2026-10-19", "2026-10-25"))
+
+    async def test_overall_alert_counts_from_payday(self):  # CUJ 1
+        self.sign_in()
+        await self.payday_on()
+        await self.salary(date(2026, 10, 31))
+        await self.set_limits(monthly="10000")
+        await self.row("DEBIT", 6000, at_noon(date(2026, 10, 30)))  # the calendar piece before the period
+        await self.row("DEBIT", 6000, at_noon(date(2026, 10, 31)))
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            await self.debit("4500.00", when=PAY_NOW)
+        [note] = await self.limit_notifications()
+        self.assertEqual(note.dedupe_key, "spend_limit:monthly:2026-10-31:10000.00")
+        self.assertIn("₹10,500.00 of ₹10,000.00 this month (Sat 31 Oct – Sun 29 Nov)", note.body)
+        [alert] = await self.alerts()
+        self.assertEqual((alert.period, alert.period_start, alert.status), ("monthly", date(2026, 10, 31), "sent"))
+        [mail] = self.google.sent
+        self.assertIn("this month (Sat 31 Oct – Sun 29 Nov)", body_text(mail))
+
+    async def test_a_late_salary_extends_the_period(self):  # CUJ 2
+        self.sign_in()
+        await self.payday_on()
+        await self.salary(date(2026, 10, 31))
+        await self.set_limits(monthly="10000")
+        await self.row("DEBIT", 9000, at_noon(date(2026, 12, 1)))
+        with patch("limits.utc_now", return_value=at_noon(date(2026, 12, 2))):
+            await self.debit("2000.00", when=at_noon(date(2026, 12, 2)))
+        [november] = await self.limit_notifications()
+        self.assertEqual(november.dedupe_key, "spend_limit:monthly:2026-10-31:10000.00")
+        self.assertIn("this month (Sat 31 Oct – Wed 2 Dec)", november.body)
+        await self.salary(date(2026, 12, 3))
+        await self.row("DEBIT", 9000, at_noon(date(2026, 12, 3)))
+        with patch("limits.utc_now", return_value=at_noon(date(2026, 12, 4))):
+            await self.debit("2000.00", when=at_noon(date(2026, 12, 4)))
+            await self.debit("10.00", when=at_noon(date(2026, 12, 4)))
+        notes = await self.limit_notifications()
+        self.assertEqual([n.dedupe_key for n in notes], ["spend_limit:monthly:2026-10-31:10000.00",
+                                                         "spend_limit:monthly:2026-12-03:10000.00"])
+        self.assertIn("₹11,000.00 of ₹10,000.00 this month (Thu 3 Dec – Sat 2 Jan)", notes[1].body)
+        self.assertEqual([a.period_start for a in await self.alerts()], [date(2026, 10, 31), date(2026, 12, 3)])
+
+    async def test_category_limit_follows_the_period(self):
+        self.sign_in()
+        await self.payday_on()
+        await self.salary(date(2026, 10, 31))
+        await self.set_limits(monthly="2000", category="Food & Dining")
+        await self.row("DEBIT", 1500, at_noon(date(2026, 10, 30)), category="Food & Dining")  # not counted
+        await self.row("DEBIT", 1500, at_noon(date(2026, 10, 31)), category="Food & Dining")
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            await self.debit("600.00", merchant="SWIGGY", when=PAY_NOW)
+        [note] = await self.limit_notifications()
+        self.assertEqual(note.dedupe_key, "spend_limit:Food & Dining:monthly:2026-10-31:2000.00")
+        self.assertIn("₹2,100.00 of ₹2,000.00 on Food & Dining this month (Sat 31 Oct – Sun 29 Nov)", note.body)
+
+    async def test_summary_in_pay_mode(self):
+        self.sign_in()
+        await self.payday_on()
+        await self.salary(date(2026, 10, 31))
+        await self.set_limits(weekly="5000", monthly="20000")
+        await self.row("DEBIT", 700, at_noon(date(2026, 10, 30)))
+        await self.row("DEBIT", 300, at_noon(date(2026, 10, 31)))
+        await self.row("DEBIT", 200, at_noon(date(2026, 11, 9)))
+        statements = []
+
+        def record(conn, cursor, statement, *args):
+            statements.append(statement)
+
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            data = (await self.client.get("/api/v1/limits")).json()
+            async with AsyncSessionLocal() as db:
+                event.listen(engine.sync_engine, "before_cursor_execute", record)
+                try:
+                    await limits.summarize(db, self.owner, await limits.load_rules(db, self.owner.id))
+                finally:
+                    event.remove(engine.sync_engine, "before_cursor_execute", record)
+        self.assertEqual((data["monthly"]["start"], data["monthly"]["end"], data["monthly"]["spent"]),
+                         ("2026-10-31", "2026-11-29", 500))
+        self.assertEqual((data["weekly"]["start"], data["weekly"]["end"], data["weekly"]["spent"]),
+                         ("2026-11-09", "2026-11-15", 200))
+        # The limits you've set, the pay-period setting, your salary days, every meter.
+        self.assertEqual(len(statements), 4, statements)
+
+    async def test_on_with_no_salary_keeps_calendar_months(self):  # CUJ 3
+        self.sign_in()
+        off = (await self.client.get("/api/v1/limits")).json()
+        await self.payday_on()
+        on = (await self.client.get("/api/v1/limits")).json()
+        self.assertEqual((on["weekly"], on["monthly"]), (off["weekly"], off["monthly"]))
+        self.assertEqual((on["monthly"]["start"], on["monthly"]["end"]), ("2026-10-01", "2026-10-31"))
+        windows, _ = await self.windows(NOW)
+        self.assertEqual(windows["monthly"], limits.period_window("monthly", NOW))
+        self.assertIsNone(windows["previous_monthly"])
+
+    async def test_current_windows(self):
+        windows, count = await self.windows()
+        self.assertEqual((set(windows), count), ({"weekly", "monthly"}, 1))
+        self.assertEqual(windows["monthly"], limits.period_window("monthly", PAY_NOW))
+        await self.salary(date(2026, 10, 31))
+        await self.payday_on()
+        windows, count = await self.windows()
+        self.assertEqual((set(windows), count), ({"weekly", "monthly", "previous_monthly"}, 2))
+        self.assertEqual(windows["weekly"], limits.period_window("weekly", PAY_NOW))
+        self.assertEqual(windows["monthly"], (date(2026, 10, 31), ist_start(date(2026, 10, 31)), ist_start(date(2026, 11, 30))))
+        self.assertIsNone(windows["previous_monthly"])
+        await self.salary(date(2026, 9, 30))
+        windows, _ = await self.windows()
+        self.assertEqual(windows["previous_monthly"],
+                         (date(2026, 9, 30), ist_start(date(2026, 9, 30)), ist_start(date(2026, 10, 31))))
+        windows, count = await self.windows(payday=True)  # the caller already has the setting
+        self.assertEqual(count, 1)
+        self.assertEqual(windows["monthly"][0], date(2026, 10, 31))
+        windows, count = await self.windows(payday=False)
+        self.assertEqual((set(windows), count), ({"weekly", "monthly"}, 0))
 
 
 class GmailAuthorizeScriptTests(unittest.TestCase):

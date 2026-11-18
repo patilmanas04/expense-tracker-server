@@ -26,6 +26,7 @@ from test_post_save import NOW, ORIGIN, SWIGGY_UPI, PostSaveTestCase
 IST = timezone(timedelta(hours=5, minutes=30))
 EARLIER = datetime(2026, 10, 5, 12, 0, tzinfo=IST)  # Mon 5 Oct: this month, an earlier week
 LAST_MONTH = datetime(2026, 9, 30, 12, 0, tzinfo=IST)
+PAY_NOW = datetime(2026, 11, 10, 12, 0, tzinfo=IST)  # Tue 10 Nov
 FOOD = "Food & Dining"
 WARN_ERROR = "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."
 
@@ -206,6 +207,44 @@ class OverallWarningTests(WarningTestCase):
         self.assertEqual(await self.warnings(), [])
 
 
+class PaydayWarningTests(WarningTestCase):
+    """Warnings follow pay periods when 'Month starts on payday' is on (pay_periods.py)."""
+
+    async def payday(self):
+        """The setting on and a salary on 31 Oct: the period runs 31 Oct – 29 Nov on 10 Nov."""
+        await self.seed("Acme Payroll", 50000, datetime(2026, 10, 31, 10, 0, tzinfo=IST), category="Salary",
+                        type="CREDIT", user_id=self.owner.id)
+        await self.settings(periods__payday=True)
+
+    async def test_monthly_warning_in_pay_mode(self):
+        await self.payday()
+        await self.limit(monthly=10000)
+        await self.seed(amount=5000, when=datetime(2026, 10, 30, 12, 0, tzinfo=IST))  # before the period
+        await self.seed(amount=6000, when=datetime(2026, 10, 31, 12, 0, tzinfo=IST))
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            await self.pay(2100, when=PAY_NOW)
+        [warning] = await self.warnings()
+        self.assertEqual(warning.dedupe_key, "spend_warn:monthly:2026-10-31:10000.00:80")
+        self.assertEqual(warning.body, "₹8,100.00 of ₹10,000.00 this month (Sat 31 Oct – Sun 29 Nov) · 81%")
+        self.assertEqual(await self.reached(), [])
+
+    async def test_on_costs_one_statement_more(self):
+        await self.limit(weekly=100000, monthly=100000, category=FOOD)  # never reached: nothing is written
+        await self.limit(weekly=100000, monthly=100000)
+        txn_id = await self.seed(amount=10, when=PAY_NOW)
+
+        async def statements() -> int:
+            async with AsyncSessionLocal() as db:
+                ctx = await post_save.load(db, txn_id, "edit")
+                return await self.count_statements(lambda: limits.post_save_check(ctx))
+
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            off = await statements()
+            await self.payday()
+            on = await statements()
+        self.assertEqual(on, off + 1)  # the salary query; the setting comes with the runner's settings
+
+
 class MerchantWarningTests(WarningTestCase):
     async def test_merchant_limit_warns_with_its_id_in_the_key(self):
         limit_id = await self.merchant_limit("Swiggy", monthly=1000)
@@ -236,9 +275,10 @@ class WarnSettingTests(WarningTestCase):
     async def test_default_is_80(self):
         response = await self.client.get("/api/v1/settings")
         self.assertEqual(response.json(), {"alerts.large_amount": None, "alerts.unusual": True,
-                                           "limits.warn_percent": 80, "alerts.low_balance": None})
+                                           "limits.warn_percent": 80, "alerts.low_balance": None,
+                                           "periods.payday": False})
         self.assertEqual(list(response.json()), ["alerts.large_amount", "alerts.unusual", "limits.warn_percent",
-                                                 "alerts.low_balance"])
+                                                 "alerts.low_balance", "periods.payday"])
 
     async def test_invalid_levels_write_nothing(self):
         for value in (45, 82, 100, 0, 50.5, True, "80", 96, 49, -80, [80]):

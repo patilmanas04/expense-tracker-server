@@ -9,7 +9,8 @@ limit, period, limit amount and level (keys spend_warn:…). The rule is state-b
 edit, AI retry, merge, Not a duplicate) gives the same answer.
 
 "Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance), and not possible duplicates waiting for your decision (duplicates.py).
-Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
+Weeks run Monday to Sunday (IST). Months follow the calendar, or pay periods when 'Month starts on payday' is on
+(pay_periods.py; current_windows).
 Which payments a merchant limit counts is decided in merchants.py.
 
 The checks run after each saved payment through post_save.py (post_save_check, registered in main.py for every
@@ -34,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import mailer
 import merchants
+import pay_periods
 import post_save
 from auth import FRONTEND_URL, current_user, same_origin
 from dashboard import ownership
@@ -84,6 +86,24 @@ def period_window(period: str, moment: datetime) -> tuple[date, datetime, dateti
         return datetime.combine(d, time.min, IST).astimezone(timezone.utc)
 
     return start, to_utc(start), to_utc(end)
+
+
+Window = tuple[date, datetime, datetime]  # first IST day, UTC start, exclusive UTC end
+
+
+async def current_windows(db: AsyncSession, user: User, now: datetime,
+                          payday: Optional[bool] = None) -> dict[str, Optional[Window]]:
+    """The weekly and monthly windows for `now`, computed once per entry point and passed down. Monthly is the pay
+    period (or cut calendar month) when 'Month starts on payday' is on; then "previous_monthly" is set too: the pay
+    period ending the day before, or None. With the setting off that key is absent (callers that need it check
+    `"previous_monthly" in windows`), so loops walk PERIODS, never .values(). `payday` skips the settings read
+    when the caller already has it."""
+    windows: dict[str, Optional[Window]] = {period: period_window(period, now) for period in PERIODS}
+    periods = await pay_periods.load(db, user, payday)
+    if periods is not None:
+        windows["monthly"] = pay_periods.monthly_window(periods, now)
+        windows["previous_monthly"] = pay_periods.previous_window(periods, windows["monthly"][0])
+    return windows
 
 
 def _last_day(end_utc: datetime) -> date:
@@ -383,7 +403,7 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
     overall = next((rule for rule in rules if rule.category == ALL), None)
     per_category = [rule for rule in rules if rule.category != ALL]
     currency = overall.currency if overall else "INR"
-    windows = {period: period_window(period, now) for period in PERIODS}
+    windows = await current_windows(db, user, now)
 
     def amounts(rule: Optional[Rule]) -> dict[str, Optional[Decimal]]:
         return {period: getattr(rule, f"{period}_limit") if rule else None for period in PERIODS}
@@ -587,7 +607,8 @@ async def preview_merchant(merchant: str = "", user: User = Depends(current_user
     if not merchants.words(name) or len(name) > MAX_MERCHANT_LENGTH:
         return MerchantPreview(known=False, counts=[])
     known = await _is_known(db, user, name)
-    spans = {period: period_window(period, utc_now())[1:] for period in PERIODS}
+    windows = await current_windows(db, user, utc_now())
+    spans = {period: windows[period][1:] for period in PERIODS}
     _, _, counts = merchants.meter(name, await _merchant_rows(db, user, "INR"), spans)
     return MerchantPreview(known=known, counts=counts)
 
@@ -742,6 +763,7 @@ async def post_save_check(ctx: PostSave) -> None:
         return
     now, when = utc_now(), _utc(txn.transaction_time)
     warn_percent = ctx.settings["limits.warn_percent"]  # None = warnings Off
+    windows = await current_windows(db, owner, now, ctx.settings.get("periods.payday", False))
     setting = await _setting(db, owner.id)
     if setting is not None and txn.currency == setting.currency:
         currency = setting.currency
@@ -750,7 +772,7 @@ async def post_save_check(ctx: PostSave) -> None:
             limit = limits[period]
             if limit is None:
                 continue
-            start_date, start, end = period_window(period, now)
+            start_date, start, end = windows[period]
             if not start <= when < end:
                 continue  # a late SMS for a past week/month doesn't alert
             spent = await spent_between(db, owner, currency, start, end)
@@ -761,9 +783,9 @@ async def post_save_check(ctx: PostSave) -> None:
                     await _alert_once(db, owner, period, start_date, end, limit, spent, txn, currency)
             elif _warns(spent, limit, warn_percent):  # in-app only, never emailed
                 await _notify_once(db, owner, period, start_date, end, limit, spent, currency, warn_percent=warn_percent)
-    await _check_category(db, owner, txn, now, when, warn_percent)
+    await _check_category(db, owner, txn, windows, when, warn_percent)
     try:  # last and on its own, so a failure here can't stop the overall and category alerts
-        await _check_merchants(db, owner, txn, now, when, warn_percent)
+        await _check_merchants(db, owner, txn, windows, when, warn_percent)
     except Exception:
         logger.exception("Merchant limit check failed")
 
@@ -775,8 +797,8 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
         await post_save_check(ctx)
 
 
-async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime,
-                          warn_percent: Optional[int]) -> None:
+async def _check_category(db: AsyncSession, owner: User, txn: Transaction, windows: dict[str, Optional[Window]],
+                          when: datetime, warn_percent: Optional[int]) -> None:
     """The limit on this transaction's category: a notification, plus one best-effort email; or the in-app
     warning at `warn_percent` (None = Off) while still under it."""
     if txn.category not in LIMIT_CATEGORIES:
@@ -791,7 +813,7 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
         limit = limits[period]
         if limit is None:
             continue
-        start_date, start, end = period_window(period, now)
+        start_date, start, end = windows[period]
         if not start <= when < end:
             continue
         spent = await spent_between(db, owner, currency, start, end, category)
@@ -808,8 +830,8 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
                 logger.warning("Category limit email failed: %s", error)
 
 
-async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime,
-                           warn_percent: Optional[int]) -> None:
+async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, windows: dict[str, Optional[Window]],
+                           when: datetime, warn_percent: Optional[int]) -> None:
     """Every merchant limit whose name matches this transaction's merchant: a notification each,
     plus one best-effort email, as for category limits; or the in-app warning while still under it."""
     if txn.currency != "INR":
@@ -819,8 +841,7 @@ async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now:
              for rule in await load_merchant_limits(db, owner.id) if merchants.matches(rule.merchant, txn.merchant)]
     if not rules:
         return
-    windows = {period: period_window(period, now) for period in PERIODS}
-    since = min(start for _, start, _ in windows.values())
+    since = min(windows[period][1] for period in PERIODS)  # never .values(): it may hold previous_monthly
     rows = await _merchant_rows(db, owner, "INR", since)
     spans = {period: windows[period][1:] for period in PERIODS}
     for rule_id, merchant, currency, weekly_limit, monthly_limit in rules:

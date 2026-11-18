@@ -80,7 +80,7 @@ Each SMS gets its name and category from, in order:
 
 **Self Transfer** is money moved between your own accounts. Nothing assigns it automatically except Gemini when the SMS itself says so ("to self", "own account"); you pick it by editing a transaction. **Transfer** is still a payment to or from another person.
 
-**Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month. A debit that mentions interest is never income.
+**Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month, unless 'Month starts on payday' is on, when months start on salary day (see Pay periods). A debit that mentions interest is never income.
 
 When the regex parser can't read an SMS and Gemini parses all of it, the merged name and a matching rule's category still apply (a rule's category replaces Gemini's; `parsed_by` stays `ai_agent`); otherwise your category for the merchant does. An SMS nobody could read (Needs review) gets neither.
 
@@ -199,10 +199,11 @@ All need the dashboard session; writes (the preview included) also need the dash
 **Settings → Alerts** in the app. Every setting is one row in `settings_store.KEYS` (its default and its validation), stored as JSON text in `user_settings` (one row per setting, added by `create_all`), so a new setting needs no new column.
 
 ```http
-GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80, "alerts.low_balance": null}   (every key, always in this order)
+GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80, "alerts.low_balance": null, "periods.payday": false}   (every key, always in this order)
 PUT /api/v1/settings   {"alerts.large_amount": 5000}   -> the full object after saving
 PUT /api/v1/settings   {"limits.warn_percent": null}   -> warnings Off
 PUT /api/v1/settings   {"alerts.low_balance": 10000}   -> alert when Balance left drops below ₹10,000
+PUT /api/v1/settings   {"periods.payday": true}        -> months start on payday (see Pay periods)
 ```
 
 | Key | Value | Default |
@@ -211,6 +212,7 @@ PUT /api/v1/settings   {"alerts.low_balance": 10000}   -> alert when Balance lef
 | `alerts.unusual` | `true` / `false` | `true` |
 | `limits.warn_percent` | the near-limit warning level: 50 to 95 in steps of 5, or `null` (Off) | `80` |
 | `alerts.low_balance` | the low-balance level: whole rupees, 1 to 10,00,00,000, or `null` (Off); the app shows it under Settings → Bank balance | `null` (Off) |
+| `periods.payday` | "Month starts on payday" (see Pay periods): `true` / `false` | `false` |
 
 Both need the dashboard session (401 "Please sign in…" without it); `PUT` also needs the dashboard `Origin` (403 "Invalid request origin."). `PUT` is partial: it changes only the keys given, and `{}` changes nothing. Validation is strict JSON typing: an amount must be a JSON integer (`5000.0` is taken as `5000`); `true`, `"5000"` and `5000.5` are rejected, and `alerts.unusual` takes only `true` or `false`. Every key is checked before anything is written, so a 422 writes nothing; it names the first bad key in the body's order:
 
@@ -218,9 +220,33 @@ Both need the dashboard session (401 "Please sign in…" without it); `PUT` also
 - `{"detail": "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."}`,
 - `{"detail": "alerts.unusual: Choose on or off."}`,
 - `{"detail": "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."}` (45, 82, 100, 0, 50.5, `true`, `"80"`; `80.0` is taken as `80`),
-- `{"detail": "alerts.low_balance: Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off."}` (0, 100000001, `true`, `"5000"`, 5000.5; `5000.0` is taken as `5000`).
+- `{"detail": "alerts.low_balance: Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off."}` (0, 100000001, `true`, `"5000"`, 5000.5; `5000.0` is taken as `5000`),
+- `{"detail": "periods.payday: Choose on or off."}` (`"yes"`, `1`, `null`).
 
 A body that isn't a JSON object gets FastAPI's own 422 (a list `detail`). A missing row means the default; a stored `null` is a value (for `alerts.large_amount`, Off). A stored value that no longer passes its key's rules is logged and read as the default. Two first saves of the same key at once end with one row (the loser's commit fails and it updates the winner's row). `KEY` is a reserved word in MySQL/TiDB: SQLAlchemy quotes it, and no raw SQL may use this table.
+
+## Pay periods
+
+**Settings → Appearance → Month starts on payday** (`periods.payday`, default off). Off, months are calendar months, as before. On, each "month" starts on the day your salary arrives, and Home, Report, Activity's month filter and the monthly limits (overall, category and merchant, their alerts and near-limit warnings) all follow it. Weekly limits stay Monday–Sunday. The rules live once on the server, in `pay_periods.py`; the app loads the result and keeps its own copy of the date maths in `expense-tracker-client/lib/periods.ts`.
+
+- **Salary days**: the IST dates of parsed INR credits in category **Salary** (hand-added ones count; yours or with no owner), not possible duplicates waiting for your decision.
+- **Name**: a salary day pays for its own month on the 1st–15th and for the next month on the 16th or later (the dashboard's income rule). 31 Oct → "Nov"; 2 Nov → "Nov"; 16 Jan → "Feb".
+- **Start**: for each name, the earliest salary day with that name starts its period; later Salary credits with the same name (a bonus, a split salary) start nothing. When the previous name has no period and that day is on or after the 1st of the named month, the period starts on the 1st (a first salary ever on 5 Nov starts "Nov" on 1 Nov).
+- **End**: the day before the next period starts, and no later than its latest end, the 15th of the month after the name ("Nov" ends by 15 Dec).
+- **Days outside every period** (before the first salary, after a latest end) count in their calendar month, cut to those days (16–31 Dec after "Nov" reached 15 Dec).
+- **The open period** (the newest, while today is in it) has an expected last day: the day before the same date one month after its start (31 Oct → 29 Nov; 31 Jan → 27 Feb), never before today and never after its latest end. It's used for the limit windows, the dates in alerts and "days left" only, never to decide which period a payment belongs to. Nothing is predicted: a late salary just extends the current period ("Nov · 31 Oct – today" on 2 Dec), and the next period starts the day it arrives.
+
+```http
+GET /api/v1/periods   -> {"enabled": true,
+                          "periods": [{"month": "2026-10", "start": "2026-09-30", "end": "2026-10-30"},
+                                      {"month": "2026-11", "start": "2026-10-31", "end": "2026-12-15"}]}
+```
+
+Every period back to the first salary, oldest first; `end` is inclusive, and the newest period's is its latest end (the app works out the expected last day). Off: `{"enabled": false, "periods": []}`; on with no salary found: `{"enabled": true, "periods": []}` (months stay 1st–end). It needs the dashboard session (401 without it); it's read-only, so no `Origin` check.
+
+Monthly limit windows use the pay period for the current day when the setting is on (`limits.current_windows`); alert keys, `SpendAlert` rows and wording are unchanged and built from the window's first day (`spend_limit:monthly:2026-10-31:10000.00`, "this month (Sat 31 Oct – Sun 29 Nov)"). A period's first day only changes if you edit or delete a Salary credit, and past alerts aren't recomputed then. Cost: reading periods is 1 statement with the setting off (the setting) and 2 with it on (plus the salary days), once per entry point (`GET /api/v1/limits`, the merchant preview, the after-save check); the after-save check already has your settings, so it adds 0 off and 1 on.
+
+Tests: `tests/test_pay_periods.py` (the rules, windows, salary days, loading and the API), `tests/test_alerts.py` (`PaydayLimitTests`: overall and category alerts, a late salary, the summary), `tests/test_limit_warnings.py` (`PaydayWarningTests`) and `tests/test_merchant_limits.py` (a merchant limit in pay mode).
 
 ## After a payment is saved
 
@@ -243,7 +269,7 @@ One background task, `post_save.run(transaction_id, cause)`, runs every check th
 
 A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
 
-Cost per saved SMS once every planned check ships, one check at a time and after the reply: the runner's 4 queries, limits 6–8, payment alerts 1, low balance 2, recurring about 5, refunds 1–2 for credits, transfers 1–2 for parsed SMS: about 20 round trips, 4–6 s on TiDB, which nothing waits for. A restart drops queued tasks.
+Cost per saved SMS once every planned check ships, one check at a time and after the reply: the runner's 4 queries, limits 6–8 (one more with 'Month starts on payday' on), payment alerts 1, low balance 2, recurring about 5, refunds 1–2 for credits, transfers 1–2 for parsed SMS: about 20 round trips, 4–6 s on TiDB, which nothing waits for. A restart drops queued tasks.
 
 ## Payment alerts
 
@@ -308,7 +334,7 @@ Money in these texts drops a trailing ".00" ("₹649", "₹10,688.10"); names ov
 
 ## Spend limits, notifications and (optional) email alerts
 
-Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the app: parsed debits, card spends included, except Credit Card Payment, Self Transfer and Investments & Finance (see What counts as spending), so a card bill or an SIP never trips a limit. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. Monthly limits follow calendar months, or your pay periods when "Month starts on payday" is on (see Pay periods); their keys and wording are the same either way. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the app: parsed debits, card spends included, except Credit Card Payment, Self Transfer and Investments & Finance (see What counts as spending), so a card bill or an SIP never trips a limit. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
 
 **Warning before a limit is reached:** once spending on a limit is at or above the warning level (`limits.warn_percent` in Settings; 80% by default, Off with `null`) and still under the limit (level ≤ spent < limit, compared exactly, so ₹4,000.00 of ₹5,000 warns at 80%), Folio creates one in-app notification, `kind = "spend_warning"`: "80% of your monthly Food & Dining limit used", "80% of your weekly spend limit used" (overall) or "80% of your monthly Swiggy limit used" (a merchant name over 120 characters is cut with "…"). The body is the same as the reached alert's ("₹4,150.00 of ₹5,000.00 on Food & Dining this month (Thu 1 Oct – Sat 31 Oct) · 83%"; " at Swiggy" for a merchant, nothing for overall) and it links to `/settings/limits`. It goes out once per limit, period, limit amount and level, by its dedupe key: `spend_warn:{period}:{start}:{limit}:{level}` overall, `spend_warn:{category}:{period}:{start}:{limit}:{level}` for a category, `spend_warn:merchant:{limit_id}:{period}:{start}:{limit}:{level}` for a merchant (for example `spend_warn:Food & Dining:monthly:2026-10-01:5000.00:80`); so changing the limit or the level allows one more. Warnings are never emailed. A payment that jumps straight past the limit gives only the reached alert ("… limit crossed"), no warning. The rule depends only on the current total, so every check gives the same answer: an edit that brings spending down from over the limit back into the band warns once; a late SMS for a past week or month never warns (only the payment's own current period is checked, as for reached alerts); and `check_spend_limits` (merges and rule applies) warns too. The same guards apply as for reached alerts: the overall limit only for payments in its currency, a category limit only for the payment's own category, merchant limits only where the name matches. `GET /api/v1/limits` is unchanged: a meter's `alerted` means the reached alert only.
 

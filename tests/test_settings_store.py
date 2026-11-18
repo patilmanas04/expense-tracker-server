@@ -27,7 +27,7 @@ from models import User, UserSetting
 
 ORIGIN = {"Origin": "http://localhost:3000"}
 DEFAULTS = {"alerts.large_amount": None, "alerts.unusual": True, "limits.warn_percent": 80,
-            "alerts.low_balance": None}
+            "alerts.low_balance": None, "periods.payday": False}
 AMOUNT_ERROR = "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."
 UNUSUAL_ERROR = "alerts.unusual: Choose on or off."
 
@@ -108,7 +108,7 @@ class DefaultsTests(SettingsTestCase):
         await self.put({"alerts.large_amount": 5000})
         data = await self.put({"alerts.unusual": False})
         self.assertEqual(data, {"alerts.large_amount": 5000, "alerts.unusual": False, "limits.warn_percent": 80,
-                                "alerts.low_balance": None})
+                                "alerts.low_balance": None, "periods.payday": False})
         self.assertEqual(list(data), list(settings_store.KEYS))
         self.assertEqual(await self.get(), data)
 
@@ -143,6 +143,18 @@ class ValidationTests(SettingsTestCase):
         for value in (None, 1, 0, "yes", "true"):
             with self.subTest(value=value):
                 await self.rejected({"alerts.unusual": value}, UNUSUAL_ERROR)
+
+    async def test_payday_is_on_or_off(self):
+        for value in ("yes", 1, None, "true", 0):
+            with self.subTest(value=value):
+                await self.rejected({"periods.payday": value}, "periods.payday: Choose on or off.")
+        data = await self.put({"periods.payday": True})
+        self.assertIs(data["periods.payday"], True)
+        self.assertEqual(list(data)[-1], "periods.payday")
+        [row] = await self.rows()
+        self.assertEqual((row.key, row.value), ("periods.payday", "true"))
+        self.assertIs((await self.get())["periods.payday"], True)
+        self.assertIs((await self.put({"periods.payday": False}))["periods.payday"], False)
 
     async def test_nothing_is_written_when_a_later_key_is_bad(self):
         await self.rejected({"alerts.large_amount": 5000, "alerts.unusual": "yes"}, UNUSUAL_ERROR)
@@ -224,7 +236,7 @@ class StoredValueTests(SettingsTestCase):
         async with AsyncSessionLocal() as db:
             self.assertEqual(await settings_store.load(db, self.other.id),
                              {"alerts.large_amount": 100, "alerts.unusual": False, "limits.warn_percent": 80,
-                              "alerts.low_balance": None})
+                              "alerts.low_balance": None, "periods.payday": False})
 
 
 class RaceAndTableTests(SettingsTestCase):

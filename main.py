@@ -33,6 +33,7 @@ from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, affects_bank_balance, owner_balance, router as balance_router
 from limits import router as limits_router
 from notifications import router as notifications_router
+from pay_periods import router as periods_router
 from dashboard import ownership
 
 # After-save checks (post_save.py), in the order they run. Later designs add their line here.
@@ -82,6 +83,7 @@ app.include_router(auth_router)
 app.include_router(balance_router)
 app.include_router(limits_router)
 app.include_router(notifications_router)
+app.include_router(periods_router)
 app.include_router(rules.names_router)
 app.include_router(rules.rules_router)
 app.include_router(settings_store.router)

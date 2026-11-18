@@ -102,6 +102,8 @@ KEYS: dict[str, Key] = {
         1, 100_000_000, nullable=True,
         message="Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off.",
     )),
+    # Months start on the day your salary (category Salary) arrives (pay_periods.py). Off = calendar months.
+    "periods.payday": Key(False, boolean(message="Choose on or off.")),
 }
 
 

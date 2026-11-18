@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import limits
 import merchants
+import pay_periods
+import settings_store
 from auth import current_user
 from database import AsyncSessionLocal, Base, engine
 from main import app
@@ -40,6 +42,7 @@ NOW = datetime(2026, 10, 21, 6, 30, tzinfo=timezone.utc)
 IST = timezone(timedelta(hours=5, minutes=30))
 EARLIER_THIS_MONTH = datetime(2026, 10, 5, 12, 0, tzinfo=IST)
 LAST_MONTH = datetime(2026, 9, 30, 12, 0, tzinfo=IST)
+PAY_NOW = datetime(2026, 11, 10, 12, 0, tzinfo=IST)  # Tue 10 Nov
 
 
 class ImportOrderTests(unittest.TestCase):
@@ -493,11 +496,11 @@ class MerchantLimitTests(GoogleTestCase):
         self.sign_in()
         await self.set_limits(weekly="500")
         await self.set_limits(weekly="100", category="Food & Dining")
-        self.assertEqual(await self.statements_for_summary(), 3)  # rules, merchant limits, meters
+        self.assertEqual(await self.statements_for_summary(), 4)  # rules, merchant limits, pay-period setting, meters
         await self.put("Swiggy", weekly="100", category="Food & Dining")
         await self.put("Zomato", monthly="900", category="Food & Dining")
         await self.debit("150.00")
-        self.assertEqual(await self.statements_for_summary(), 4)  # plus one read of your debits
+        self.assertEqual(await self.statements_for_summary(), 5)  # plus one read of your debits
         merchants = (await self.summary())["merchants"]
         self.assertEqual([(m["merchant"], m["weekly"]["alerted"], m["monthly"]["alerted"]) for m in merchants],
                          [("Swiggy", True, False), ("Zomato", False, False)])
@@ -532,6 +535,31 @@ class MerchantLimitTests(GoogleTestCase):
         async with AsyncSessionLocal() as db:
             summary = await limits.summarize(db, self.owner, await limits.load_rules(db, self.owner.id))
         self.assertEqual(summary.merchants, [])
+
+    # ---------- Pay periods ('Month starts on payday', pay_periods.py) ----------
+
+    async def test_monthly_merchant_limit_in_pay_mode(self):
+        self.sign_in()
+        await self.seed("Acme Payroll", 50000, datetime(2026, 10, 31, 10, 0, tzinfo=IST), kind="CREDIT", category="Salary")
+        async with AsyncSessionLocal() as db:
+            await settings_store.save(db, self.owner.id, {"periods.payday": True})
+        await self.seed("Swiggy", 2000, datetime(2026, 10, 30, 12, 0, tzinfo=IST))  # before the period
+        await self.seed("Swiggy", 2800, datetime(2026, 10, 31, 12, 0, tzinfo=IST))
+        limit_id = next(m["id"] for m in (await self.put("Swiggy", monthly="3000"))["merchants"])
+        with patch("limits.utc_now", return_value=PAY_NOW):
+            await self.debit("400.00", merchant="SWIGGY LTD", when=PAY_NOW)
+            [limit] = (await self.summary())["merchants"]
+            with patch("pay_periods.load", wraps=pay_periods.load) as load:
+                self.assertEqual(await self.preview("Swiggy"), {"known": True, "counts": ["Swiggy", "Swiggy Ltd"]})
+            load.assert_called_once()
+        [note] = await self.notifications()
+        self.assertEqual(note["body"], "₹3,200.00 of ₹3,000.00 at Swiggy this month (Sat 31 Oct – Sun 29 Nov) · 106%")
+        async with AsyncSessionLocal() as db:
+            keys = list(await db.scalars(select(Notification.dedupe_key)))
+        self.assertEqual(keys, [f"spend_limit:merchant:{limit_id}:monthly:2026-10-31:3000.00"])
+        self.assertEqual((limit["monthly"]["start"], limit["monthly"]["end"], limit["monthly"]["spent"]),
+                         ("2026-10-31", "2026-11-29", 3200))
+        self.assertTrue(limit["monthly"]["alerted"])
 
     # ---------- Known merchants and the preview ----------
 
