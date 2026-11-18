@@ -351,10 +351,10 @@ class MerchantLimitTests(GoogleTestCase):
         await self.put("Swiggy", weekly="500", category="Food & Dining")
         await self.debit("600.00")
         await self.put("Swiggy", weekly="1000")
-        await self.debit("300.00")  # 900 < 1000
-        self.assertEqual(len(await self.notifications()), 1)
+        await self.debit("300.00")  # 900 < 1000 (90%: a spend_warning, tests/test_limit_warnings.py)
+        self.assertEqual(len([n for n in await self.notifications() if n["kind"] == "spend_limit"]), 1)
         await self.debit("150.00")  # 1050 >= 1000
-        notes = await self.notifications()
+        notes = [n for n in await self.notifications() if n["kind"] == "spend_limit"]
         self.assertEqual([n["title"] for n in notes], ["Weekly Swiggy limit crossed"] * 2)
         self.assertEqual(len(self.google.sent), 2)
         self.assertIn("₹1,000.00", body_text(self.google.sent[1]))

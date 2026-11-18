@@ -49,9 +49,10 @@ class SettingError(ValueError):
     """An unknown key or an invalid value; str(error) is the 422 detail."""
 
 
-def whole_number(low: int, high: int, *, nullable: bool, message: str) -> Callable[[Any], Any]:
+def whole_number(low: int, high: int, *, nullable: bool, message: str, step: int = 1) -> Callable[[Any], Any]:
     """A JSON integer from `low` to `high` (a float with no fraction, like 5000.0, becomes 5000), or null when
-    `nullable`. true/false, strings and fractions are rejected (Python's bool is an int)."""
+    `nullable`. true/false, strings and fractions are rejected (Python's bool is an int). With `step`, only
+    `low`, `low + step`, … are accepted (50, 55, … 95 for a step of 5)."""
 
     def validate(value: Any) -> Any:
         if value is None and nullable:
@@ -63,6 +64,8 @@ def whole_number(low: int, high: int, *, nullable: bool, message: str) -> Callab
                 raise ValueError(message)
             value = int(value)
         if not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(message)
+        if (value - low) % step:
             raise ValueError(message)
         return value
 
@@ -89,6 +92,11 @@ KEYS: dict[str, Key] = {
     )),
     # A payment at least 3x what you usually spend at the merchant gets a notification (payment_alerts.py).
     "alerts.unusual": Key(True, boolean(message="Choose on or off.")),
+    # Warn once when a spend limit is this full (limits.py), 50–95 in steps of 5. null = Off.
+    "limits.warn_percent": Key(80, whole_number(
+        50, 95, step=5, nullable=True,
+        message="Choose 50% to 95% in steps of 5, or Off.",
+    )),
 }
 
 

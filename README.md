@@ -194,20 +194,23 @@ All need the dashboard session; writes (the preview included) also need the dash
 **Settings → Alerts** in the app. Every setting is one row in `settings_store.KEYS` (its default and its validation), stored as JSON text in `user_settings` (one row per setting, added by `create_all`), so a new setting needs no new column.
 
 ```http
-GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true}   (every key, always in this order)
+GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80}   (every key, always in this order)
 PUT /api/v1/settings   {"alerts.large_amount": 5000}   -> the full object after saving
+PUT /api/v1/settings   {"limits.warn_percent": null}   -> warnings Off
 ```
 
 | Key | Value | Default |
 | --- | --- | --- |
 | `alerts.large_amount` | whole rupees, 1 to 1,00,00,000, or `null` (Off) | `null` (Off) |
 | `alerts.unusual` | `true` / `false` | `true` |
+| `limits.warn_percent` | the near-limit warning level: 50 to 95 in steps of 5, or `null` (Off) | `80` |
 
 Both need the dashboard session (401 "Please sign in…" without it); `PUT` also needs the dashboard `Origin` (403 "Invalid request origin."). `PUT` is partial: it changes only the keys given, and `{}` changes nothing. Validation is strict JSON typing: an amount must be a JSON integer (`5000.0` is taken as `5000`); `true`, `"5000"` and `5000.5` are rejected, and `alerts.unusual` takes only `true` or `false`. Every key is checked before anything is written, so a 422 writes nothing; it names the first bad key in the body's order:
 
 - `{"detail": "Unknown setting: <key>"}` (the key cut to 64 characters),
 - `{"detail": "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."}`,
-- `{"detail": "alerts.unusual: Choose on or off."}`.
+- `{"detail": "alerts.unusual: Choose on or off."}`,
+- `{"detail": "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."}` (45, 82, 100, 0, 50.5, `true`, `"80"`; `80.0` is taken as `80`).
 
 A body that isn't a JSON object gets FastAPI's own 422 (a list `detail`). A missing row means the default; a stored `null` is a value (for `alerts.large_amount`, Off). A stored value that no longer passes its key's rules is logged and read as the default. Two first saves of the same key at once end with one row (the loser's commit fails and it updates the winner's row). `KEY` is a reserved word in MySQL/TiDB: SQLAlchemy quotes it, and no raw SQL may use this table.
 
@@ -251,6 +254,8 @@ Skipped: credits, other currencies, payments that need review, categories that a
 ## Spend limits, notifications and (optional) email alerts
 
 Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the app: parsed debits, card spends included, except Credit Card Payment, Self Transfer and Investments & Finance (see What counts as spending), so a card bill or an SIP never trips a limit. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+
+**Warning before a limit is reached:** once spending on a limit is at or above the warning level (`limits.warn_percent` in Settings; 80% by default, Off with `null`) and still under the limit (level ≤ spent < limit, compared exactly, so ₹4,000.00 of ₹5,000 warns at 80%), Folio creates one in-app notification, `kind = "spend_warning"`: "80% of your monthly Food & Dining limit used", "80% of your weekly spend limit used" (overall) or "80% of your monthly Swiggy limit used" (a merchant name over 120 characters is cut with "…"). The body is the same as the reached alert's ("₹4,150.00 of ₹5,000.00 on Food & Dining this month (Thu 1 Oct – Sat 31 Oct) · 83%"; " at Swiggy" for a merchant, nothing for overall) and it links to `/settings/limits`. It goes out once per limit, period, limit amount and level, by its dedupe key: `spend_warn:{period}:{start}:{limit}:{level}` overall, `spend_warn:{category}:{period}:{start}:{limit}:{level}` for a category, `spend_warn:merchant:{limit_id}:{period}:{start}:{limit}:{level}` for a merchant (for example `spend_warn:Food & Dining:monthly:2026-10-01:5000.00:80`); so changing the limit or the level allows one more. Warnings are never emailed. A payment that jumps straight past the limit gives only the reached alert ("… limit crossed"), no warning. The rule depends only on the current total, so every check gives the same answer: an edit that brings spending down from over the limit back into the band warns once; a late SMS for a past week or month never warns (only the payment's own current period is checked, as for reached alerts); and `check_spend_limits` (merges and rule applies) warns too. The same guards apply as for reached alerts: the overall limit only for payments in its currency, a category limit only for the payment's own category, merchant limits only where the name matches. `GET /api/v1/limits` is unchanged: a meter's `alerted` means the reached alert only.
 
 **Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
 

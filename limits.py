@@ -3,6 +3,11 @@ each is reached, an in-app notification is created (bell on Home), plus a Gmail 
 keys are configured (optional; retried for overall limits, best effort for category and merchant
 limits).
 
+Before a limit is reached, one in-app warning (kind spend_warning, no email) when spending is at or above
+limits.warn_percent of the limit (settings_store; default 80, null = Off) and still below it. It goes out once per
+limit, period, limit amount and level (keys spend_warn:…). The rule is state-based, so every check (new payment,
+edit, AI retry, merge, Not a duplicate) gives the same answer.
+
 "Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance), and not possible duplicates waiting for your decision (duplicates.py).
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
 Which payments a merchant limit counts is decided in merchants.py.
@@ -137,6 +142,21 @@ def _notification_key(period: str, start: date, limit: Decimal, category: Option
 def _merchant_notification_key(limit_id: uuid.UUID, period: str, start: date, limit: Decimal) -> str:
     # The limit's id, not its name, keeps "Swiggy" and "SWIGGY" apart under any collation.
     return f"spend_limit:merchant:{limit_id}:{period}:{start.isoformat()}:{Decimal(limit):.2f}"
+
+
+def _warning_key(period: str, start: date, limit: Decimal, warn_percent: int, category: Optional[str] = None) -> str:
+    # Like _notification_key, plus the level: changing the limit or the level allows a new warning.
+    scope = f"{category}:" if category else ""
+    return f"spend_warn:{scope}{period}:{start.isoformat()}:{Decimal(limit):.2f}:{warn_percent}"
+
+
+def _merchant_warning_key(limit_id: uuid.UUID, period: str, start: date, limit: Decimal, warn_percent: int) -> str:
+    return f"spend_warn:merchant:{limit_id}:{period}:{start.isoformat()}:{Decimal(limit):.2f}:{warn_percent}"
+
+
+def _warns(spent: Decimal, limit: Decimal, warn_percent: Optional[int]) -> bool:
+    """At or above the warning level (callers check the limit first). Exact in Decimal, no division."""
+    return warn_percent is not None and spent * 100 >= limit * warn_percent
 
 
 def merchant_debits(user: User, currency: str, since: Optional[datetime] = None):
@@ -687,20 +707,30 @@ async def _alert_once(db: AsyncSession, user: User, period: str, start: date, en
 
 async def _notify_once(db: AsyncSession, user: User, period: str, start: date, end: datetime,
                        limit: Decimal, spent: Decimal, currency: str, category: Optional[str] = None, *,
-                       label: Optional[str] = None, dedupe_key: Optional[str] = None) -> bool:
+                       label: Optional[str] = None, dedupe_key: Optional[str] = None,
+                       warn_percent: Optional[int] = None) -> bool:
     """True if the notification is new (it's only ever created once per limit and period).
-    `label` is a merchant limit's full name; it's shortened in the title only."""
+    `label` is a merchant limit's full name; it's shortened in the title only. With `warn_percent`, the early
+    warning at that level instead of the reached alert (same body)."""
     noun = "week" if period == "weekly" else "month"
-    state = "reached" if spent == limit else "crossed"
     on = f" at {label}" if label else f" on {category}" if category else ""
+    scope = _short_label(label) if label else category
+    if warn_percent is None:
+        state = "reached" if spent == limit else "crossed"
+        kind, title = "spend_limit", f"{_limit_name(period, scope)} {state}"
+        key = dedupe_key or _notification_key(period, start, limit, category)
+    else:
+        kind = "spend_warning"
+        title = f"{warn_percent}% of your {'weekly' if period == 'weekly' else 'monthly'} {scope or 'spend'} limit used"
+        key = dedupe_key or _warning_key(period, start, limit, warn_percent, category)
     return await create_once(
         db, user.id,
-        kind="spend_limit",
-        title=f"{_limit_name(period, _short_label(label) if label else category)} {state}",
+        kind=kind,
+        title=title,
         body=(f"{format_money(spent, currency)} of {format_money(limit, currency)}{on} this {noun} "
               f"({_window_text(start, end)}) · {int(spent * 100 / limit)}%"),
         link="/settings/limits",
-        dedupe_key=dedupe_key or _notification_key(period, start, limit, category),
+        dedupe_key=key,
     )
 
 
@@ -711,6 +741,7 @@ async def post_save_check(ctx: PostSave) -> None:
     if not txn.is_parsed or txn.type != "DEBIT" or not counts_as_spending(txn.category):
         return
     now, when = utc_now(), _utc(txn.transaction_time)
+    warn_percent = ctx.settings["limits.warn_percent"]  # None = warnings Off
     setting = await _setting(db, owner.id)
     if setting is not None and txn.currency == setting.currency:
         currency = setting.currency
@@ -723,15 +754,16 @@ async def post_save_check(ctx: PostSave) -> None:
             if not start <= when < end:
                 continue  # a late SMS for a past week/month doesn't alert
             spent = await spent_between(db, owner, currency, start, end)
-            if spent < limit:
-                continue
-            await _notify_once(db, owner, period, start_date, end, limit, spent, currency)
-            # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
-            if mailer.configured():
-                await _alert_once(db, owner, period, start_date, end, limit, spent, txn, currency)
-    await _check_category(db, owner, txn, now, when)
+            if spent >= limit:
+                await _notify_once(db, owner, period, start_date, end, limit, spent, currency)
+                # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
+                if mailer.configured():
+                    await _alert_once(db, owner, period, start_date, end, limit, spent, txn, currency)
+            elif _warns(spent, limit, warn_percent):  # in-app only, never emailed
+                await _notify_once(db, owner, period, start_date, end, limit, spent, currency, warn_percent=warn_percent)
+    await _check_category(db, owner, txn, now, when, warn_percent)
     try:  # last and on its own, so a failure here can't stop the overall and category alerts
-        await _check_merchants(db, owner, txn, now, when)
+        await _check_merchants(db, owner, txn, now, when, warn_percent)
     except Exception:
         logger.exception("Merchant limit check failed")
 
@@ -743,8 +775,10 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
         await post_save_check(ctx)
 
 
-async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
-    """The limit on this transaction's category: a notification, plus one best-effort email."""
+async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime,
+                          warn_percent: Optional[int]) -> None:
+    """The limit on this transaction's category: a notification, plus one best-effort email; or the in-app
+    warning at `warn_percent` (None = Off) while still under it."""
     if txn.category not in LIMIT_CATEGORIES:
         return
     rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category))
@@ -762,6 +796,9 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
             continue
         spent = await spent_between(db, owner, currency, start, end, category)
         if spent < limit:
+            if _warns(spent, limit, warn_percent):  # in-app only, never emailed
+                await _notify_once(db, owner, period, start_date, end, limit, spent, currency, category,
+                                   warn_percent=warn_percent)
             continue
         if await _notify_once(db, owner, period, start_date, end, limit, spent, currency, category) and mailer.configured():
             try:
@@ -771,9 +808,10 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, now: 
                 logger.warning("Category limit email failed: %s", error)
 
 
-async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime) -> None:
+async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now: datetime, when: datetime,
+                           warn_percent: Optional[int]) -> None:
     """Every merchant limit whose name matches this transaction's merchant: a notification each,
-    plus one best-effort email, as for category limits."""
+    plus one best-effort email, as for category limits; or the in-app warning while still under it."""
     if txn.currency != "INR":
         return  # merchant limits are in rupees
     # Plain values, as in post_save_check: a lost notification race rolls back and expires the rows.
@@ -794,6 +832,10 @@ async def _check_merchants(db: AsyncSession, owner: User, txn: Transaction, now:
             if not start <= when < end:
                 continue  # a late SMS for a past week/month doesn't alert
             if spent < limit:
+                if _warns(spent, limit, warn_percent):  # in-app only, never emailed
+                    await _notify_once(db, owner, period, start_date, end, limit, spent, currency, label=merchant,
+                                       dedupe_key=_merchant_warning_key(rule_id, period, start_date, limit, warn_percent),
+                                       warn_percent=warn_percent)
                 continue
             created = await _notify_once(db, owner, period, start_date, end, limit, spent, currency, label=merchant,
                                          dedupe_key=_merchant_notification_key(rule_id, period, start_date, limit))
