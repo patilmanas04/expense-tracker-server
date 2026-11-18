@@ -129,11 +129,16 @@ Set your current bank balance in the dashboard's Settings. From that moment, eve
 
 ```http
 GET    /api/v1/balance            -> summary, or null if not set
+GET    /api/v1/balance/breakdown  -> breakdown, or 404 "No balance set."
 PUT    /api/v1/balance            {"amount": "125000.50"}   (optional "as_of": ISO time with timezone)
 DELETE /api/v1/balance
 ```
 
-All three require the dashboard session. `PUT`/`DELETE` also require the dashboard `Origin`. When a balance is set, `success` and `duplicate` webhook responses include `balance` (`current`, `spent`, `received`, `excluded_card`, …). In Shortcuts you can add **Get Dictionary Value** `balance` → `current` and **Show Notification** "Balance left: …" after each SMS.
+All four require the dashboard session. `PUT`/`DELETE` also require the dashboard `Origin`. When a balance is set, `success` and `duplicate` webhook responses include `balance` (`current`, `spent`, `received`, `excluded_card`, …). In Shortcuts you can add **Get Dictionary Value** `balance` → `current` and **Show Notification** "Balance left: …" after each SMS.
+
+The breakdown (the app's **How it's worked out**) lists every transaction of yours (or unassigned) recorded after `as_of`, in any parse state and currency. `balance.classify` gives each one at most one reason it was skipped, the first that matches in this fixed order: `unreadable` (needs review), `other_currency`, `duplicate` (held out), `cash`, `credit_card`; a row with no reason is counted. The response has `currency`, `start` (`amount`, `as_of`), `counted` (oldest first: `{id, effect, running}`, the signed effect and the balance right after it), `skipped` (all five groups, each `{count, total, ids}`, ids oldest first; `total` is the signed net the rows would have had, `"0.00"` when empty, and always `null` for `unreadable` and `other_currency`) and `current`, which equals the summary's `current`. Order is `transaction_time`, then `created_at`, then `id`. Amounts are decimal strings with two places (`"-1249.00"`). `PUT`'s `as_of` is the app's **Read at**: the moment you read the balance in your bank's app, so payments between then and saving still count. It can be any past time (at most 5 minutes ahead); the app limits it to the last 7 days, the server doesn't.
+
+Every transaction response carries `balance_kind`: `null` when the SMS has no balance, else `"bank"` when its "Avl Bal" is a bank account's and `"card"` when it is a credit card's limit left. It uses the same test as Balance left, so a card bill paid from the bank reads `"bank"`.
 
 ## Transactions added by hand
 

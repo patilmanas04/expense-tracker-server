@@ -10,7 +10,7 @@ import uuid
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Header, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, computed_field, field_validator
 from sqlalchemy.exc import IntegrityError
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import desc, select
@@ -28,7 +28,7 @@ import settings_store
 from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
                     detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
-from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
+from balance import CASH_ACCOUNT, BalanceSummary, affects_bank_balance, owner_balance, router as balance_router
 from limits import router as limits_router
 from notifications import router as notifications_router
 from dashboard import ownership
@@ -146,6 +146,15 @@ class TransactionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime  # moves on every edit; the dashboard polls by it
     duplicate_of: Optional[uuid.UUID] = None  # the earlier transaction while this one is held out as a possible duplicate
+
+    @computed_field
+    @property
+    def balance_kind(self) -> Optional[Literal["bank", "card"]]:
+        """Whose figure the SMS's "Avl Bal" is: the bank account's, or a credit card's limit left. None without one.
+        Same test as Balance left (balance.affects_bank_balance), so a card bill paid from the bank reads "bank"."""
+        if self.balance is None:
+            return None
+        return "bank" if affects_bank_balance(self.raw_message) else "card"
 
     model_config = ConfigDict(from_attributes=True)
 

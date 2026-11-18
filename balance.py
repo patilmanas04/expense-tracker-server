@@ -2,10 +2,12 @@
 transaction recorded after it. Credit-card alerts are skipped because card spends
 leave the bank account only when the card bill is paid, which is its own debit SMS.
 Cash entries added by hand are skipped too: they never pass through the bank. Possible duplicates
-waiting for your decision (duplicates.py) are skipped too."""
+waiting for your decision (duplicates.py) are skipped too. `classify` gives each transaction since the
+saved balance one reason it was skipped, or None when it counts; `GET /api/v1/balance/breakdown` lists them."""
+import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import AwareDatetime, BaseModel, Field
@@ -36,6 +38,41 @@ def affects_bank_balance(raw_message: str) -> bool:
     return not CARD_RE.search(text) or bool(BANK_ACCOUNT_RE.search(text))
 
 
+SkipReason = Literal["unreadable", "other_currency", "duplicate", "cash", "credit_card"]
+SKIP_REASONS: tuple[SkipReason, ...] = ("unreadable", "other_currency", "duplicate", "cash", "credit_card")
+# Totals can't be added up for these: no amount, or mixed currencies.
+UNTOTALLED: frozenset[str] = frozenset({"unreadable", "other_currency"})
+
+
+def classify(is_parsed: bool, currency: str, held_out: bool, account_ref: Optional[str], raw_message: str,
+             setting_currency: str) -> Optional[SkipReason]:
+    """Why this transaction doesn't move Balance left, or None when it does.
+
+    The first reason in a fixed order wins: unreadable, other currency, possible duplicate, cash, credit card.
+    "We don't know the amount" comes before "we know it but it doesn't touch the bank", so each row has
+    exactly one reason and the skipped totals add up.
+    """
+    if not is_parsed:
+        return "unreadable"
+    if currency != setting_currency:
+        return "other_currency"
+    if held_out:
+        return "duplicate"
+    if account_ref == CASH_ACCOUNT:
+        return "cash"
+    if not affects_bank_balance(raw_message):
+        return "credit_card"
+    return None
+
+
+def _money(value) -> str:
+    """A decimal string with 2 places, no exponent and never "-0.00", e.g. "45000.00" or "-1249.00"."""
+    value = Decimal(value).quantize(Decimal("0.01"))
+    if not value:
+        value = Decimal("0.00")
+    return format(value, "f")
+
+
 def _utc(value: datetime) -> datetime:
     # SQLite drops the offset; values are always stored in UTC.
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
@@ -61,7 +98,8 @@ class BalanceSummary(BaseModel):
 
 async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> BalanceSummary:
     rows = (await db.execute(
-        select(Transaction.type, Transaction.amount, Transaction.raw_message, Transaction.account_ref).where(
+        select(Transaction.type, Transaction.amount, Transaction.raw_message, Transaction.account_ref,
+               Transaction.is_parsed, Transaction.currency).where(
             ownership(user),
             Transaction.is_parsed.is_(True),
             Transaction.currency == setting.currency,
@@ -71,11 +109,12 @@ async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> Ba
     )).all()
     spent = received = Decimal(0)
     counted = excluded = 0
-    for kind, amount, raw_message, account_ref in rows:
-        if account_ref == CASH_ACCOUNT:
-            continue
-        if not affects_bank_balance(raw_message):
+    for kind, amount, raw_message, account_ref, is_parsed, currency in rows:
+        # held_out=False: not_held_out() already removed them above.
+        reason = classify(is_parsed, currency, False, account_ref, raw_message, setting.currency)
+        if reason == "credit_card":
             excluded += 1
+        if reason is not None:
             continue
         counted += 1
         if kind == "CREDIT":
@@ -95,6 +134,81 @@ async def summarize(db: AsyncSession, user: User, setting: BalanceSetting) -> Ba
     )
 
 
+class BalanceStart(BaseModel):
+    amount: str  # decimal string, the saved balance
+    as_of: datetime  # UTC; transactions strictly after it count
+
+
+class CountedRow(BaseModel):
+    id: uuid.UUID
+    effect: str  # "-1249.00" for a debit, "500.00" for a credit
+    running: str  # Balance left right after this row
+
+
+class SkipGroup(BaseModel):
+    count: int
+    total: Optional[str]  # signed net if they had counted; null for unreadable / other_currency
+    ids: list[uuid.UUID]  # oldest first
+
+
+class SkippedGroups(BaseModel):
+    unreadable: SkipGroup
+    other_currency: SkipGroup
+    duplicate: SkipGroup
+    cash: SkipGroup
+    credit_card: SkipGroup
+
+
+class BalanceBreakdown(BaseModel):
+    currency: str
+    start: BalanceStart
+    counted: list[CountedRow]  # oldest first (running-total order)
+    skipped: SkippedGroups
+    current: str  # equals summarize().current
+
+
+async def breakdown(db: AsyncSession, user: User, setting: BalanceSetting) -> BalanceBreakdown:
+    """Every transaction since the saved balance, in running-total order: the ones that moved it, with the
+    balance after each, and the rest grouped by the one reason `classify` gives them."""
+    rows = (await db.execute(
+        select(Transaction.id, Transaction.type, Transaction.amount, Transaction.currency, Transaction.is_parsed,
+               Transaction.account_ref, Transaction.raw_message, Transaction.duplicate_of,
+               Transaction.transaction_time, Transaction.created_at)
+        .where(ownership(user), Transaction.transaction_time > _utc(setting.as_of))
+        .order_by(Transaction.transaction_time, Transaction.created_at, Transaction.id)
+    )).all()
+    opening = Decimal(setting.opening_balance)
+    running = opening
+    counted: list[CountedRow] = []
+    groups = {reason: {"count": 0, "total": Decimal(0), "ids": []} for reason in SKIP_REASONS}
+    for row in rows:
+        amount = Decimal(row.amount)
+        signed = amount if row.type == "CREDIT" else -amount
+        reason = classify(row.is_parsed, row.currency, row.duplicate_of is not None, row.account_ref,
+                          row.raw_message, setting.currency)
+        if reason is None:
+            running += signed
+            counted.append(CountedRow(id=row.id, effect=_money(signed), running=_money(running)))
+            continue
+        group = groups[reason]
+        group["count"] += 1
+        group["ids"].append(row.id)
+        if reason not in UNTOTALLED:
+            group["total"] += signed
+    skipped = SkippedGroups(**{
+        reason: SkipGroup(count=group["count"], ids=group["ids"],
+                          total=None if reason in UNTOTALLED else _money(group["total"]))
+        for reason, group in groups.items()
+    })
+    return BalanceBreakdown(
+        currency=setting.currency,
+        start=BalanceStart(amount=_money(opening), as_of=_utc(setting.as_of)),
+        counted=counted,
+        skipped=skipped,
+        current=_money(running),
+    )
+
+
 async def owner_balance(db: AsyncSession) -> Optional[BalanceSummary]:
     """Balance for the dashboard owner; used by the SMS webhook, which has no session."""
     if not OWNER_EMAIL:
@@ -109,6 +223,14 @@ async def owner_balance(db: AsyncSession) -> Optional[BalanceSummary]:
 async def get_balance(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     setting = await db.scalar(select(BalanceSetting).where(BalanceSetting.user_id == user.id))
     return await summarize(db, user, setting) if setting else None
+
+
+@router.get("/breakdown", response_model=BalanceBreakdown)
+async def get_breakdown(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    setting = await db.scalar(select(BalanceSetting).where(BalanceSetting.user_id == user.id))
+    if setting is None:
+        raise HTTPException(404, "No balance set.")
+    return await breakdown(db, user, setting)
 
 
 @router.put("", response_model=BalanceSummary, dependencies=[Depends(same_origin)])
