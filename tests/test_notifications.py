@@ -11,22 +11,26 @@ for key in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN", "AL
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from auth import current_user
 from database import AsyncSessionLocal, Base, engine
+import notifications
 from main import app
-from models import Notification, SpendAlert, User
+from models import Notification, NotificationDismissal, SpendAlert, User
+from notifications import NotificationAction, Resolution
 
 ORIGIN = {"Origin": "http://localhost:3000"}
 HOOK = {"X-Webhook-Secret": "test-webhook-secret"}
 NOW = datetime(2026, 10, 21, 6, 30, tzinfo=timezone.utc)  # Wed 21 Oct, 12:00 IST
 
 
-class NotificationTests(unittest.IsolatedAsyncioTestCase):
+class NotificationTestCase(unittest.IsolatedAsyncioTestCase):
+    """Owner and another user, signed in as the owner, the limits clock at NOW."""
+
     async def asyncSetUp(self):
         async with engine.begin() as connection:
             await connection.run_sync(Base.metadata.drop_all)
@@ -60,6 +64,8 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+
+class NotificationTests(NotificationTestCase):
     async def test_reaching_a_limit_creates_one_unread_notification_without_email(self):
         await self.set_limits(weekly="500")
         await self.debit("300.00")
@@ -173,6 +179,75 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         foreign = {"Origin": "https://attacker.example"}
         self.assertEqual((await self.client.delete("/api/v1/notifications", headers=foreign)).status_code, 403)
         self.assertEqual((await self.client.delete(f"/api/v1/notifications/{theirs}", headers=foreign)).status_code, 403)
+
+
+class NotificationActionTests(NotificationTestCase):
+    """Buttons on notifications (notifications.register_actions)."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        async with AsyncSessionLocal() as db:
+            def note(user, kind, key, minutes):
+                return Notification(user_id=user.id, kind=kind, title=key, body="body", link=None, dedupe_key=key,
+                                    created_at=NOW - timedelta(minutes=minutes))
+            self.first = note(self.owner, "test_action", "first", 1)
+            self.second = note(self.owner, "test_action", "second", 2)
+            self.limit = note(self.owner, "spend_limit", "limit", 3)
+            self.theirs = note(self.other, "test_action", "theirs", 4)
+            self.dismissed = note(self.owner, "test_action", "dismissed", 5)
+            db.add_all([self.first, self.second, self.limit, self.theirs, self.dismissed])
+            await db.commit()
+            db.add(NotificationDismissal(notification_id=self.dismissed.id))
+            await db.commit()
+        self.buttons = [NotificationAction(label="Confirm", path="/api/v1/x/1/confirm"),
+                        NotificationAction(label="No", path="/api/v1/x/1/reject")]
+
+    def resolver(self, **kwargs):
+        return patch.dict(notifications._RESOLVERS, {"test_action": AsyncMock(**kwargs)})
+
+    async def test_resolver_gives_buttons_or_resolved_text(self):
+        resolutions = {self.first.id: Resolution(self.buttons, None), self.second.id: Resolution([], "Marked as done")}
+        with self.resolver(return_value=resolutions):
+            inbox = await self.inbox()
+            resolver = notifications._RESOLVERS["test_action"]
+        items = {item["title"]: item for item in inbox["items"]}
+        self.assertEqual(list(items), ["first", "second", "limit"])
+        self.assertEqual(items["first"]["actions"], [{"label": "Confirm", "path": "/api/v1/x/1/confirm"},
+                                                     {"label": "No", "path": "/api/v1/x/1/reject"}])
+        self.assertIsNone(items["first"]["resolved"])
+        self.assertEqual((items["second"]["actions"], items["second"]["resolved"]), ([], "Marked as done"))
+        self.assertEqual((items["limit"]["actions"], items["limit"]["resolved"]), ([], None))
+        resolver.assert_awaited_once()
+        self.assertEqual([n.id for n in resolver.await_args.args[1]], [self.first.id, self.second.id])
+
+    async def test_failing_resolver_leaves_defaults(self):
+        with self.resolver(side_effect=RuntimeError("boom")), self.assertLogs("notifications", "ERROR"):
+            response = await self.client.get("/api/v1/notifications")
+        self.assertEqual(response.status_code, 200, response.text)
+        inbox = response.json()
+        self.assertEqual(inbox["unread"], 3)
+        self.assertEqual([(i["actions"], i["resolved"]) for i in inbox["items"]], [([], None)] * 3)
+
+    async def test_other_kinds_still_resolve_after_a_failure(self):
+        async def limit_resolver(db, rows):
+            return {row.id: Resolution([], f"Done: {row.title}") for row in rows}  # reads rows after the rollback
+        with self.resolver(side_effect=RuntimeError("boom")), self.assertLogs("notifications", "ERROR"), \
+                patch.dict(notifications._RESOLVERS, {"spend_limit": limit_resolver}):
+            inbox = await self.inbox()
+        self.assertEqual([i["resolved"] for i in inbox["items"]], [None, None, "Done: limit"])
+
+    async def test_resolver_leaving_a_notification_out(self):
+        with self.resolver(return_value={}):
+            inbox = await self.inbox()
+        self.assertEqual([(i["actions"], i["resolved"]) for i in inbox["items"]], [([], None)] * 3)
+
+    async def test_register_actions(self):
+        async def resolve(db, rows):
+            return {}
+        with patch.dict(notifications._RESOLVERS):
+            notifications.register_actions("k", resolve)
+            self.assertIs(notifications._RESOLVERS["k"], resolve)
+        self.assertNotIn("k", notifications._RESOLVERS)
 
 
 if __name__ == "__main__":

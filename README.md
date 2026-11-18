@@ -72,12 +72,27 @@ Each SMS gets its category from, in order:
 
 1. **Your category for that merchant.** Editing a transaction's category (or picking one when adding by hand) saves it in `merchant_categories`, per merchant and direction (paying vs. money in). It beats the keyword rules. Choosing Uncategorized forgets it.
 2. **The keyword rules** in `parser.py`.
-3. **Your earlier payments** to the same merchant: the category of the latest categorised one.
+3. **Your earlier payments** to the same merchant: the category of the latest categorised one, never "Self Transfer" (only a category you picked in step 1 carries that to the next payment).
 4. **Gemini**, waited on for at most 5 s so the Shortcut stays quick. If it's slower or failing, the SMS is saved Uncategorized and a background task retries with a 30 s limit (right away, then after 1 and 5 minutes) and fills the category in. An edit you make meanwhile always wins. Retries live in the server process, so a restart during those minutes drops them; the transaction just stays Uncategorized for you to set.
+
+**Card bills.** A debit SMS that names a credit card and a bank account ("Rs.3000.00 debited from HDFC Bank A/c XX4821 … towards HDFC Bank Credit Card XX9012") is a card bill paid from the bank: **Credit Card Payment**. The check (`parser.is_card_bill_debit`, the same one the bank balance uses) runs on the whole SMS before the merchant keywords, so a bill "towards Amazon Pay ICICI Credit Card" isn't Shopping, and again after a Gemini full parse, whatever Gemini guessed. Card swipes never name a bank account and keep their merchant's category. The card's own "payment received" SMS is also Credit Card Payment; that rule is for credits only, because a debit saying "payment … card" can be a card autopay for a purchase.
+
+**Self Transfer** is money moved between your own accounts. Nothing assigns it automatically except Gemini when the SMS itself says so ("to self", "own account"); you pick it by editing a transaction. **Transfer** is still a payment to or from another person.
 
 **Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month. A debit that mentions interest is never income.
 
 `parsed_by` records where the category came from: `regex`, `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
+
+## What counts as spending
+
+`spending.py` holds the one rule; the app's totals, the report and the spend limits all follow it.
+
+| Set | Categories | Effect |
+| --- | --- | --- |
+| `NOT_COUNTED` | Credit Card Payment, Self Transfer | Neither spending nor income: the card spends already counted, and money between your own accounts isn't spent. |
+| `INVESTED` | Investments & Finance | Neither; the app shows its debits as **Invested**. Investment credits (redemptions) count as nothing. |
+
+Every other category counts, including Cash Withdrawal, Transfer, Uncategorized and no category: debits as spending, credits as income. Net flow is income − spending − invested. The app keeps a copy of both sets in `expense-tracker-client/lib/categories.ts`; `tests/test_spending.py` compares them (and the category order) when both repos sit side by side. Past months' figures change once when this ships, because card bills, self transfers and investments stop counting retroactively.
 
 ## Bank balance
 
@@ -114,11 +129,13 @@ All three need the dashboard session and `Origin`. A delete is permanent; if the
 
 ## Spend limits, notifications and (optional) email alerts
 
-Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the dashboard: parsed debits, card spends included. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending limits**. When a debit SMS takes your spending to or past a limit, Folio creates one **in-app notification** for that week/month: a red dot on the bell on Home, opening a drawer, with each notification linking to Settings → Spending limits. That needs no setup. **Email is optional and off** until you add the Gmail keys below; with them, the same event also sends one email. "Spent" matches the app: parsed debits, card spends included, except Credit Card Payment, Self Transfer and Investments & Finance (see What counts as spending), so a card bill or an SIP never trips a limit. The email goes out in the background after the webhook responds. A failed send is retried on the next payments (up to 3 tries), and the error shows in Settings. Raising a limit re-arms its alert.
+
+**Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
 
 **Clearing notifications:** `DELETE /api/v1/notifications/{id}` (swipe to delete) and `DELETE /api/v1/notifications` (Clear) hide notifications instead of deleting them (`notification_dismissals`, added by `create_all`). Each notification is also the record that its alert went out, so a cleared limit alert isn't sent again on the next payment, and the meter in Settings still says "notified".
 
-**Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary, Income, Refunds & Cashback) and Uncategorized can't have limits. With Gmail set up, a category alert also sends one email, best effort (not retried).
+**Per category:** in the same card, *Limit for* switches between **All spending** (the overall limit above) and a category, each with its own weekly and/or monthly amount. A category limit counts only debits in that category, and crossing it raises its own notification ("Weekly Food & Dining limit crossed"). It's checked when an SMS arrives, when you add or edit a transaction, and when the background AI retry fills a category in later. Money-in categories (Salary, Income, Refunds & Cashback), Uncategorized and the categories that aren't spending (Credit Card Payment, Self Transfer, Investments & Finance) can't have limits (422 "Pick a spending category, or All."). Limits saved on those before this release are hidden and never alert; `scripts/recategorise_card_payments.py` deletes them. With Gmail set up, a category alert also sends one email, best effort (not retried).
 
 ```http
 GET /api/v1/limits   -> overall `weekly`/`monthly`, plus `categories`: [{category, weekly, monthly}]
@@ -129,7 +146,7 @@ PUT /api/v1/limits   {"category": "Food & Dining", "weekly_limit": "1500", "mont
 
 Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start.
 
-**Per merchant:** a limit on one merchant name, such as Swiggy, with the same weekly/monthly periods, meter and one-time notification ("Monthly Swiggy limit crossed"). It counts every parsed INR debit (yours, plus SMS from the Shortcut) whose merchant name contains the limit's name as the **same whole words with the same case**; anything that isn't a letter, digit or combining mark (such as the vowel signs in "स्विगी") separates words. Names are compared in Unicode NFC, so "Café" typed with a separate accent is the same name. Matching lives in `merchants.py` and runs in Python, so no database collation changes the answer. A "Swiggy" limit counts "Swiggy" and "Swiggy Ltd", but not:
+**Per merchant:** a limit on one merchant name, such as Swiggy, with the same weekly/monthly periods, meter and one-time notification ("Monthly Swiggy limit crossed"). It counts every parsed INR debit (yours, plus SMS from the Shortcut) whose category counts as spending and whose merchant name contains the limit's name as the **same whole words with the same case**; anything that isn't a letter, digit or combining mark (such as the vowel signs in "स्विगी") separates words. Names are compared in Unicode NFC, so "Café" typed with a separate accent is the same name. Matching lives in `merchants.py` and runs in Python, so no database collation changes the answer. A "Swiggy" limit counts "Swiggy" and "Swiggy Ltd", but not:
 
 - "SWIGGY" or "swiggy ltd" (different case; an SMS read by Gemini keeps the bank's capitals),
 - "Swiggyone" or "Amazonpayindiap" for Amazon (not a whole word),
@@ -151,6 +168,8 @@ The name is put in NFC, trimmed and its spaces collapsed; it needs at least one 
 3. A **known** name (one you've paid, or typed before, with the same case once both are cleaned, so a payment stored as "Amazon  Pay" makes "Amazon Pay" known) gets the limit; `category` is ignored.
 4. A new name needs `category`, a spending category (422 "Pick a category for this new merchant." without it). The name is saved as a known merchant exactly as typed, and the category goes into merchant memory, unless memory already has one for that name in any case (a typed "swiggy" never changes what "Swiggy" gets).
 5. All in one commit; two simultaneous saves end with one limit.
+
+Only spending counts here too, so a merchant you've paid only in Investments & Finance (or Credit Card Payment, Self Transfer) isn't known and a limit on it shows ₹0.
 
 Known merchants are every name you've paid in INR ("Swiggy" and "SWIGGY" are two) plus the typed ones, cleaned (names that are the same once cleaned are one entry, their payments added), most payments first. The preview also reports a name with a limit as known. It never errors: an empty name, one with no words, one over 255 characters or one with invalid characters gives `{"known": false, "counts": []}`. Merchant limits live in `merchant_limits` and typed merchants in `known_merchants`, both added by `create_all`; a typed merchant stays known after its limit is deleted. Each table is unique on a SHA-256 of the exact name (`merchant_hash`, `name_hash`) rather than the name, because MySQL's default collation would treat "Swiggy" and "SWIGGY" as one. The production collation of `transactions.merchant` (`SHOW FULL COLUMNS FROM transactions LIKE 'merchant'`) is not recorded here yet; nothing depends on it.
 
@@ -195,12 +214,25 @@ Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope,
 | Rejected GMAIL_CLIENT_ID / SECRET | The refresh token must come from the same client as these two values. |
 
 ```http
-GET  /api/v1/notifications       -> {"unread": 1, "items": [{id, kind, title, body, link, created_at, read}]}
+GET  /api/v1/notifications       -> {"unread": 1, "items": [{id, kind, title, body, link, created_at, read, actions, resolved}]}
 POST /api/v1/notifications/read  {"ids": ["…"]}  (omit ids to mark all read)
 GET  /api/v1/limits              -> this week/month spent, limits, notified flag, email status
 PUT  /api/v1/limits              {"weekly_limit": "5000", "monthly_limit": null}   (null = no limit)
 POST /api/v1/limits/test-email
 ```
+
+## One-time fix after this release
+
+Card-bill debits saved before the card-bill check may sit in Shopping, Transfer or Uncategorized, and category limits may exist on categories that no longer count. `scripts/recategorise_card_payments.py` lists and fixes both:
+
+```sh
+uv run python scripts/recategorise_card_payments.py                    # dry run: lists what would change
+uv run python scripts/recategorise_card_payments.py --apply            # changes every listed row
+uv run python scripts/recategorise_card_payments.py --apply --ids a,b  # changes only these listed rows
+uv run python scripts/recategorise_card_payments.py --email you@example.com   # default: DASHBOARD_OWNER_EMAIL
+```
+
+The dry run prints three lists: card-bill debits to change to Credit Card Payment, Credit Card Payment debits that don't look like a bank-side bill (information only; fix any by hand), and the category limits it would delete. Review the list, then `--apply` (or `--apply --ids` with the ids you agree with; any id not in the list stops it with nothing changed). Limits are deleted on any `--apply`. On a database that isn't on this machine it asks you to type "yes" first. It's idempotent. Run it once on production after this release is deployed: dry run, review, then `--apply`.
 
 ## Webhook review
 
@@ -218,7 +250,7 @@ Implemented:
 Remaining considerations:
 
 - Configure request-body/rate limits at the public reverse proxy, use stable HTTPS, and introduce migrations when models change (`create_all` does not migrate existing columns).
-- The personal dashboard reads a maximum 367-day range into memory. Move aggregation to SQL for larger datasets, and queue ingestion if volume increases.
+- `GET /api/v1/dashboard` was removed (nothing called it; the app computes its totals from `/api/v1/transactions`). Queue ingestion if volume increases.
 - Hash deduplication treats identical normalized SMS text as the same event. Distinct identical messages require a bank/event identifier to distinguish them.
 - Parsing order: regex (tuned for HDFC/ICICI account, card and UPI alerts; the earliest debit/credit keyword decides direction, and balance/limit/due amounts are never used as the transaction amount) → Gemini full parse if regex cannot find a type and amount → Gemini category-only call if regex parsed it but no keyword rule matched (`parsed_by=regex+ai`) → `Uncategorized`. Categories are listed in `parser.CATEGORIES`.
 - Bank formats vary. The parser uses the first currency-labelled amount that is not a balance/limit; it does not extract embedded SMS dates. `received_at` (or receipt time) drives the dashboard date. Verify your bank's formats.

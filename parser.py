@@ -26,7 +26,7 @@ CATEGORIES = [
     "Food & Dining", "Groceries", "Shopping", "Travel & Commute", "Bills & Utilities",
     "Entertainment", "Investments & Finance", "Health & Fitness", "Education", "Insurance",
     "EMI & Loans", "Credit Card Payment", "Cash Withdrawal", "Salary", "Income",
-    "Refunds & Cashback", "Transfer", UNCATEGORIZED,
+    "Refunds & Cashback", "Self Transfer", "Transfer", UNCATEGORIZED,
 ]
 
 
@@ -128,7 +128,9 @@ CONTEXT_RULES = [
     # other money in is Income. Spending that mentions interest is never either.
     ("Salary", "CREDIT", r"\bsalary\b|\bsal\b|\bpayroll\b"),
     ("Income", "CREDIT", r"\binterest\b|\bint\.?\s*pd\b|\bdividend\b"),
-    ("Credit Card Payment", None, r"\b(?:credit\s*)?card(?:member)?\b.*\bpayment\b|\bpayment\b.*\bcard\b"),
+    # The card's own "payment received" SMS. Credit-only: a debit saying "payment ... card" can be a card
+    # autopay for a purchase; a bill paid from a bank account is caught by is_card_bill_debit first.
+    ("Credit Card Payment", "CREDIT", r"\b(?:credit\s*)?card(?:member)?\b.*\bpayment\b|\bpayment\b.*\bcard\b"),
     ("EMI & Loans", None, r"\bemi\b|\bloan\b|\bnach\b"),
     ("Insurance", None, r"\binsurance\b|\bpremium\b"),
     ("Investments & Finance", None, r"\bppf\b|\bssy\b|\bfd\b|\bfixed deposit\b|\bmutual fund\b|\bsip\b"),
@@ -160,6 +162,26 @@ COMPLETED_RE = re.compile(
     re.IGNORECASE,
 )
 REVERSAL_RE = re.compile(r"\b(?:refund(?:ed)?|reversed|reversal|credited back)\b", re.IGNORECASE)
+
+# Credit-card wording used by HDFC/ICICI alerts: "BLOCK CC", "Avl Limit", "Cardmember", "total due".
+CARD_RE = re.compile(
+    r"credit\s*card|\bblock\s+cc\b|\bavl\.?\s*(?:limit|lmt)\b|available\s+limit|cardmember|"
+    r"\b(?:total|minimum)\s+(?:amount\s+)?due\b",
+    re.IGNORECASE,
+)
+BANK_ACCOUNT_RE = re.compile(r"\b(?:a/c|acct|acc|account)\b", re.IGNORECASE)
+
+
+def card_text(text: str) -> str:
+    """"Credit Card Account 4xxx7001" names the card, not a bank account."""
+    return re.sub(r"card\s+account", "card", text, flags=re.IGNORECASE)
+
+
+def is_card_bill_debit(text: str) -> bool:
+    """A card bill paid from a bank account: the SMS names a credit card and a bank account
+    (the test balance.affects_bank_balance uses). Card swipes never name an account."""
+    t = card_text(text)
+    return bool(CARD_RE.search(t) and BANK_ACCOUNT_RE.search(t))
 
 # Direction keywords used by HDFC/ICICI (and most Indian banks). The earliest match wins, so
 # "ICICI Bank Acct XX1 debited for Rs 14.00; Pune Metro credited" is a DEBIT.
@@ -257,6 +279,9 @@ def detect_category(merchant: Optional[str], sms_text: str = "", tx_type: Option
     body = _strip_boilerplate(sms_text)
     if tx_type == "CREDIT" and (REVERSAL_RE.search(body) or re.search(r"\bcashback\b", body, re.IGNORECASE)):
         return "Refunds & Cashback"
+    # Before the merchant keywords: a bill "towards Amazon Pay ICICI Credit Card" isn't Shopping.
+    if tx_type == "DEBIT" and is_card_bill_debit(sms_text):
+        return "Credit Card Payment"
     category = _keyword_category(merchant)
     if category:
         return category
@@ -476,6 +501,17 @@ async def _ask_gemini(prompt: str, schema: type[BaseModel], timeout: float) -> B
     return schema.model_validate_json(response.text)
 
 
+TRANSFER_GUIDANCE = (
+    'Person-to-person transfers are "Transfer". Use "Self Transfer" only when the SMS itself says the money '
+    'moved between the user\'s own accounts (e.g. "to self", "own account"); otherwise "Transfer".'
+)
+INVESTMENT_GUIDANCE = (
+    '"Investments & Finance" is only money put into or taken out of investments and deposits (SIP, mutual '
+    'fund, shares, FD, RD, PPF, NPS); fees and charges are "Bills & Utilities" and loan payments are '
+    '"EMI & Loans".'
+)
+
+
 def _money(value: Optional[float]) -> Optional[Decimal]:
     return None if value is None else Decimal(str(round(value, 2)))
 
@@ -497,7 +533,7 @@ Instructions:
 3. amount: the transaction amount (positive). Never the balance, limit or amount due.
 4. currency: 3-letter currency code, e.g. "INR" or "USD".
 5. merchant: clean merchant, person or service name ("Swiggy", "Amazon", "Rahul Sharma"), else null.
-6. category: exactly one of {CATEGORIES}. Person-to-person and own-account transfers are "Transfer". "Salary" is only regular pay from an employer; any other money received is "Income".
+6. category: exactly one of {CATEGORIES}. {TRANSFER_GUIDANCE} {INVESTMENT_GUIDANCE} "Salary" is only regular pay from an employer; any other money received is "Income".
    Use "{UNCATEGORIZED}" if unsure.
 7. account_ref: last digits of the card/account (e.g. "XX1234"), or null.
 8. balance: available balance or credit limit after the transaction if mentioned, else null.
@@ -513,13 +549,16 @@ Instructions:
     digits = re.search(r"([0-9]{3,6})\s*$", result.account_ref or "")
     bank = detect_bank(sms_text, sender)
     account_ref = (f"{bank} XX{digits.group(1)}" if bank else f"XX{digits.group(1)}") if digits else None
+    category = normalize_category(result.category)
+    if tx_type == "DEBIT" and is_card_bill_debit(sms_text):
+        category = "Credit Card Payment"  # same check as the rules; Gemini may guess anything
 
     return ParsedTransaction(
         type=tx_type,
         amount=_money(result.amount) or Decimal(0),
         currency=currency if re.fullmatch(r"[A-Z]{3}", currency) else "INR",
         merchant=(result.merchant or "").strip()[:255] or None,
-        category=normalize_category(result.category),
+        category=category,
         account_ref=account_ref,
         balance=_money(result.balance),
         reference_id=(result.reference_id or "").strip()[:100] or None,
@@ -547,7 +586,9 @@ SMS:
 
 Reply with category exactly one of {CATEGORIES}.
 "Salary" is only regular pay from an employer; any other money received is "Income".
-Person-to-person and own-account transfers are "Transfer". Use "{UNCATEGORIZED}" if you are not reasonably sure.
+{TRANSFER_GUIDANCE}
+{INVESTMENT_GUIDANCE}
+Use "{UNCATEGORIZED}" if you are not reasonably sure.
 """
     result: _AICategory = await _ask_gemini(prompt, _AICategory, timeout=timeout)
     return normalize_category(result.category)

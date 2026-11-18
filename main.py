@@ -24,7 +24,7 @@ from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
 from limits import check_spend_limits, router as limits_router
 from notifications import router as notifications_router
-from dashboard import ownership, router as dashboard_router
+from dashboard import ownership
 
 load_dotenv()
 
@@ -64,7 +64,6 @@ app.add_middleware(
     https_only=FRONTEND_URL.startswith("https://"),
 )
 app.include_router(auth_router)
-app.include_router(dashboard_router)
 app.include_router(balance_router)
 app.include_router(limits_router)
 app.include_router(notifications_router)

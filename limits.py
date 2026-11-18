@@ -3,7 +3,7 @@ each is reached, an in-app notification is created (bell on Home), plus a Gmail 
 keys are configured (optional; retried for overall limits, best effort for category and merchant
 limits).
 
-"Spent" matches the dashboard: parsed debits in the limit's currency, card spends included.
+"Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance).
 Weeks run Monday to Sunday and months follow the calendar, both in India Standard Time.
 Which payments a merchant limit counts is decided in merchants.py.
 """
@@ -33,6 +33,7 @@ from models import (CategoryLimit, KnownMerchant, MerchantCategory, MerchantLimi
                     SpendLimit, Transaction, User)
 from notifications import create_once
 from parser import CATEGORIES, UNCATEGORIZED
+from spending import EXCLUDED_FROM_SPENDING, counts_as_spending, spending_category_filter
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -44,8 +45,10 @@ MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
 MAX_MERCHANT_LENGTH = 255  # String(255)
 LABEL_LENGTH = 120  # a merchant's name in a notification title, which holds 200 characters
 ALL = "All"  # the overall limit, across every category
-# Limits apply to spending, so money-in categories (and Uncategorized) can't have one.
-LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback")]
+# Limits apply to spending, so money-in categories, Uncategorized and categories that aren't spending
+# (spending.py) can't have one.
+LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback")
+                    and c not in EXCLUDED_FROM_SPENDING]
 
 
 def utc_now() -> datetime:
@@ -102,6 +105,7 @@ def _spent_query(user: User, currency: str, start: datetime, end: datetime, cate
         Transaction.currency == currency,
         Transaction.transaction_time >= start,
         Transaction.transaction_time < end,
+        spending_category_filter(),
     )
     return query.where(Transaction.category == category) if category else query
 
@@ -132,12 +136,15 @@ def _merchant_notification_key(limit_id: uuid.UUID, period: str, start: date, li
 
 def merchant_debits(user: User, currency: str, since: Optional[datetime] = None):
     """(merchant, amount, time) of every payment a merchant limit can count. The summary, the
-    alert check, known merchants and the preview all read through this, so they always agree."""
+    alert check, known merchants and the preview all read through this, so they always agree.
+    Only spending counts (spending.py), so a merchant paid only in excluded categories isn't known and
+    its limit shows ₹0."""
     query = select(Transaction.merchant, Transaction.amount, Transaction.transaction_time).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
         Transaction.currency == currency,
+        spending_category_filter(),
     )
     return query if since is None else query.where(Transaction.transaction_time >= since)
 
@@ -194,13 +201,15 @@ class Rule:
 
 
 async def load_rules(db: AsyncSession, user_id: uuid.UUID) -> list[Rule]:
-    """The overall limit and every category limit, in one query. Overall first, then list order."""
+    """The overall limit and every category limit, in one query. Overall first, then list order.
+    Category limits on categories that can no longer have one (left from before spending.py) are
+    skipped; scripts/recategorise_card_payments.py deletes them."""
     overall = select(
         literal(ALL, String).label("category"), SpendLimit.currency, SpendLimit.weekly_limit, SpendLimit.monthly_limit
     ).where(SpendLimit.user_id == user_id)
     per_category = select(
         CategoryLimit.category, CategoryLimit.currency, CategoryLimit.weekly_limit, CategoryLimit.monthly_limit
-    ).where(CategoryLimit.user_id == user_id)
+    ).where(CategoryLimit.user_id == user_id, CategoryLimit.category.in_(LIMIT_CATEGORIES))
     rules = [Rule(*row) for row in (await db.execute(union_all(overall, per_category))).all()]
     order = {name: i for i, name in enumerate([ALL, *LIMIT_CATEGORIES])}
     return sorted(rules, key=lambda rule: order.get(rule.category, len(order)))
@@ -695,7 +704,7 @@ async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
     if not OWNER_EMAIL:
         return
     txn = await db.get(Transaction, transaction_id)
-    if txn is None or not txn.is_parsed or txn.type != "DEBIT":
+    if txn is None or not txn.is_parsed or txn.type != "DEBIT" or not counts_as_spending(txn.category):
         return
     owner = await db.scalar(select(User).where(User.email == OWNER_EMAIL))
     if owner is None or txn.user_id not in (None, owner.id):

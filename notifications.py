@@ -2,10 +2,14 @@
 
 Swiping one away or clearing them all hides them (`notification_dismissals`) rather than deleting
 them: each notification is also the record that its alert went out, which stops repeats.
+
+Some notifications carry buttons; see register_actions.
 """
+import logging
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Awaitable, Callable, NamedTuple, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
@@ -18,6 +22,29 @@ from database import get_db
 from models import Notification, NotificationDismissal, User
 
 router = APIRouter(prefix="/api/v1/notifications", tags=["Notifications"])
+logger = logging.getLogger(__name__)
+
+
+class NotificationAction(BaseModel):
+    label: str
+    path: str
+
+
+class Resolution(NamedTuple):
+    actions: list[NotificationAction]
+    resolved: Optional[str]
+
+
+ActionResolver = Callable[[AsyncSession, list[Notification]], Awaitable[dict[uuid.UUID, Resolution]]]
+_RESOLVERS: dict[str, ActionResolver] = {}
+
+
+def register_actions(kind: str, resolver: ActionResolver) -> None:
+    """For notifications with buttons. A feature registers its kind once, at import. The inbox calls the
+    resolver once per request with every listed notification of that kind and gets back, per
+    notification id, its buttons (each a POST path under /api/v1/) or, once decided, the text shown in
+    their place. A notification it leaves out gets neither."""
+    _RESOLVERS[kind] = resolver
 
 
 def _utc(value: datetime) -> datetime:
@@ -65,6 +92,8 @@ class NotificationOut(BaseModel):
     link: Optional[str]
     created_at: datetime
     read: bool
+    actions: list[NotificationAction] = []
+    resolved: Optional[str] = None
 
 
 class Inbox(BaseModel):
@@ -83,11 +112,42 @@ async def list_notifications(limit: int = Query(30, ge=1, le=100), user: User = 
         select(Notification).where(*_visible(user.id))
         .order_by(Notification.created_at.desc()).limit(limit)
     )).all()
-    return Inbox(unread=await _unread(db, user.id), items=[
+    unread = await _unread(db, user.id)
+    # Built before the resolvers run: a resolver that fails rolls back, which expires these rows.
+    items = [
         NotificationOut(id=n.id, kind=n.kind, title=n.title, body=n.body, link=n.link,
                         created_at=_utc(n.created_at), read=n.read_at is not None)
         for n in rows
-    ])
+    ]
+    resolutions = await _resolve(db, rows)
+    for item in items:
+        resolution = resolutions.get(item.id)
+        if resolution is not None:
+            item.actions = list(resolution.actions)
+            item.resolved = resolution.resolved
+    return Inbox(unread=unread, items=items)
+
+
+async def _resolve(db: AsyncSession, rows: list[Notification]) -> dict[uuid.UUID, Resolution]:
+    """Buttons or resolved text per notification, one resolver call per kind. A resolver that fails
+    is logged and its notifications show neither, so a broken feature never breaks the bell."""
+    by_kind: dict[str, list[Notification]] = defaultdict(list)
+    for row in rows:
+        if row.kind in _RESOLVERS:
+            by_kind[row.kind].append(row)
+    resolutions: dict[uuid.UUID, Resolution] = {}
+    rolled_back = False
+    for kind, kind_rows in by_kind.items():
+        try:
+            if rolled_back:  # the rollback expired these rows; reload them for the next resolver
+                for row in kind_rows:
+                    await db.refresh(row)
+            resolutions.update(await _RESOLVERS[kind](db, kind_rows))
+        except Exception:
+            logger.exception("Notification actions for %s failed", kind)
+            await db.rollback()
+            rolled_back = True
+    return resolutions
 
 
 @router.post("/read", dependencies=[Depends(same_origin)])

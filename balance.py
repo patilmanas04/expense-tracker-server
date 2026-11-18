@@ -2,7 +2,6 @@
 transaction recorded after it. Credit-card alerts are skipped because card spends
 leave the bank account only when the card bill is paid, which is its own debit SMS.
 Cash entries added by hand are skipped too: they never pass through the bank."""
-import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
@@ -17,18 +16,12 @@ from auth import OWNER_EMAIL, current_user, same_origin
 from dashboard import ownership
 from database import get_db
 from models import BalanceSetting, Transaction, User
+from parser import BANK_ACCOUNT_RE, CARD_RE, card_text
 
 router = APIRouter(prefix="/api/v1/balance", tags=["Balance"])
 
 MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
 
-# Credit-card wording used by HDFC/ICICI alerts: "BLOCK CC", "Avl Limit", "Cardmember", "total due".
-CARD_RE = re.compile(
-    r"credit\s*card|\bblock\s+cc\b|\bavl\.?\s*(?:limit|lmt)\b|available\s+limit|cardmember|"
-    r"\b(?:total|minimum)\s+(?:amount\s+)?due\b",
-    re.IGNORECASE,
-)
-BANK_ACCOUNT_RE = re.compile(r"\b(?:a/c|acct|acc|account)\b", re.IGNORECASE)
 CASH_ACCOUNT = "Cash"  # account_ref of a transaction added by hand and paid in cash
 
 
@@ -37,7 +30,7 @@ def affects_bank_balance(raw_message: str) -> bool:
 
     A card bill paid *from* a bank account mentions the account too, so it still counts.
     """
-    text = re.sub(r"card\s+account", "card", raw_message, flags=re.IGNORECASE)
+    text = card_text(raw_message)
     return not CARD_RE.search(text) or bool(BANK_ACCOUNT_RE.search(text))
 
 

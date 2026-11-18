@@ -86,35 +86,26 @@ class APITests(unittest.IsolatedAsyncioTestCase):
             await db.commit()
 
     async def test_reads_require_login(self):
-        for endpoint in ["/api/v1/transactions", "/api/v1/dashboard?start=2026-10-01&end=2026-10-20", "/api/v1/auth/me"]:
+        for endpoint in ["/api/v1/transactions", "/api/v1/auth/me"]:
             response = await self.client.get(endpoint)
             self.assertEqual(response.status_code, 401)
             self.assertEqual(response.headers["cache-control"], "no-store")
 
-    async def test_totals_scope_currency_review_and_ist(self):
+    async def test_dashboard_route_is_gone(self):
+        url = "/api/v1/dashboard?start=2026-10-01&end=2026-10-20"
+        response = await self.client.get(url)
+        self.assertEqual((response.status_code, response.json()), (404, {"detail": "Not Found"}))
+        app.dependency_overrides[current_user] = lambda: self.owner
+        response = await self.client.get(url)
+        self.assertEqual((response.status_code, response.json()), (404, {"detail": "Not Found"}))
+
+    async def test_transactions_scope(self):
+        """Your rows and unassigned SMS rows, in every currency and state; never another user's."""
         await self.seed()
         app.dependency_overrides[current_user] = lambda: self.owner
-        response = await self.client.get("/api/v1/dashboard?start=2026-10-20&end=2026-10-20")
+        response = await self.client.get("/api/v1/transactions")
         self.assertEqual(response.status_code, 200, response.text)
-        data = response.json()
-        self.assertEqual(float(data["expense"]), 250)
-        self.assertEqual(float(data["income"]), 1000)
-        self.assertEqual(float(data["net"]), 750)
-        self.assertEqual(data["count"], 3)
-        self.assertEqual(data["review_count"], 1)
-        self.assertEqual(float(data["trend"][0]["expense"]), 250)
-        self.assertEqual(data["currencies"], ["INR", "USD"])
-        self.assertNotIn("raw_message", data["transactions"][0])
-        old = await self.client.get("/api/v1/transactions")
-        self.assertEqual(len(old.json()), 4)
-
-    async def test_filters_do_not_change_overall_totals(self):
-        await self.seed(); app.dependency_overrides[current_user] = lambda: self.owner
-        response = await self.client.get("/api/v1/dashboard?start=2026-10-01&end=2026-10-20&search=Merchant%201&kind=CREDIT")
-        data = response.json()
-        self.assertEqual(data["total"], 1)
-        self.assertEqual(data["transactions"][0]["merchant"], "Merchant 1")
-        self.assertEqual(float(data["expense"]), 250)
+        self.assertEqual(sorted(t["merchant"] for t in response.json()), [f"Merchant {i}" for i in range(4)])
 
     async def test_transactions_created_after_returns_only_new_rows(self):
         base = datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc)
@@ -143,11 +134,6 @@ class APITests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.post("/api/v1/webhook/sms", json={"message": "odd format 10"}, headers={"X-Webhook-Secret": "test-webhook-secret"})
         created = datetime.fromisoformat(response.json()["transaction"]["created_at"]).replace(tzinfo=timezone.utc)
         self.assertGreaterEqual(created, before_parse + timedelta(seconds=0.3))
-
-    async def test_invalid_date_range(self):
-        app.dependency_overrides[current_user] = lambda: self.owner
-        response = await self.client.get("/api/v1/dashboard?start=2026-10-20&end=2026-10-01")
-        self.assertEqual(response.status_code, 422)
 
     async def test_webhook_auth_validation_and_duplicate(self):
         payload = {"message": "INR 1234.56 debited from a/c XX1234 at ZOMATO", "received_at": "2026-10-20T10:00:00+05:30"}
