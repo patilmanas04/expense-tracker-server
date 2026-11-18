@@ -68,11 +68,12 @@ Create a Message automation for your bank sender, then **Get Contents of URL**, 
 
 ## Categories
 
-Each SMS gets its category from, in order:
+Each SMS gets its name and category from, in order:
 
+0. **Your merged names and category rules** (see Names and rules). The merchant becomes its merged name first; when the bank's name had no keyword category, the keyword rules run again on the merged name ("Amazonpayindiap" merged into "Amazon" is Shopping). Then the newest category rule that matches sets the category (`parsed_by = "regex+rule"`) and the steps below, Gemini included, are skipped. Both come from one query.
 1. **Your category for that merchant.** Editing a transaction's category (or picking one when adding by hand) saves it in `merchant_categories`, per merchant and direction (paying vs. money in). It beats the keyword rules. Choosing Uncategorized forgets it.
 2. **The keyword rules** in `parser.py`.
-3. **Your earlier payments** to the same merchant: the category of the latest categorised one, never "Self Transfer" (only a category you picked in step 1 carries that to the next payment).
+3. **Your earlier payments** to the same merchant: the category of the latest categorised one, never "Self Transfer" (only a category you picked in step 1 carries that to the next payment), and never one a category rule set on an SMS the regex parser read (`parsed_by = "regex+rule"`, on arrival or by Apply to past; its conditions decide: a rule for rent of ₹15,000 or more doesn't spread to a ₹300 payment to the same person). A rule's category on a payment added by hand with Auto (`manual`) or read by Gemini (`ai_agent`) has no marker, so those payments do count here, like any category they carry.
 4. **Gemini**, waited on for at most 5 s so the Shortcut stays quick. If it's slower or failing, the SMS is saved Uncategorized and a background task retries with a 30 s limit (right away, then after 1 and 5 minutes) and fills the category in. An edit you make meanwhile always wins. Retries live in the server process, so a restart during those minutes drops them; the transaction just stays Uncategorized for you to set.
 
 **Card bills.** A debit SMS that names a credit card and a bank account ("Rs.3000.00 debited from HDFC Bank A/c XX4821 … towards HDFC Bank Credit Card XX9012") is a card bill paid from the bank: **Credit Card Payment**. The check (`parser.is_card_bill_debit`, the same one the bank balance uses) runs on the whole SMS before the merchant keywords, so a bill "towards Amazon Pay ICICI Credit Card" isn't Shopping, and again after a Gemini full parse, whatever Gemini guessed. Card swipes never name a bank account and keep their merchant's category. The card's own "payment received" SMS is also Credit Card Payment; that rule is for credits only, because a debit saying "payment … card" can be a card autopay for a purchase.
@@ -81,7 +82,9 @@ Each SMS gets its category from, in order:
 
 **Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month. A debit that mentions interest is never income.
 
-`parsed_by` records where the category came from: `regex`, `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
+When the regex parser can't read an SMS and Gemini parses all of it, the merged name and a matching rule's category still apply (a rule's category replaces Gemini's; `parsed_by` stays `ai_agent`); otherwise your category for the merchant does. An SMS nobody could read (Needs review) gets neither.
+
+`parsed_by` records where the category came from: `regex`, `regex+rule` (one of your category rules), `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
 
 ## What counts as spending
 
@@ -146,7 +149,45 @@ PATCH  /api/v1/transactions/{id}   any of: type, amount, merchant, category, tra
 DELETE /api/v1/transactions/{id}   -> 204; any of your transactions, SMS or hand-added
 ```
 
-All three need the dashboard session and `Origin`. A delete is permanent; if the Shortcut sends the same SMS again it's recorded again. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. `category: null` picks one from the name with the same keyword rules as SMS. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification. A **Bank account** entry and a bank SMS for the same amount within 24 hours, in either order, flag the later one as a possible duplicate (see Possible duplicates).
+All three need the dashboard session and `Origin`. A delete is permanent; if the Shortcut sends the same SMS again it's recorded again. `PATCH` works on bank SMS too: a new category is remembered for the merchant (see Categories), and giving an SMS that needed review an amount makes it count. They're stored with `parsed_by = "manual"`; cash entries get `account_ref = "Cash"`. The name you type becomes its merged name, if you have one for it. `category: null` ("Auto") picks one with your category rules (never ones with SMS words: there's no SMS), then your category for the merchant and the same keyword rules as SMS; a category you pick is kept and remembered under the merged name. Times more than 5 minutes in the future are rejected. They count in totals and spend limits like any SMS, and an expense that crosses a limit raises the same notification. A **Bank account** entry and a bank SMS for the same amount within 24 hours, in either order, flag the later one as a possible duplicate (see Possible duplicates).
+
+## Names and rules
+
+**Settings → Names and rules** in the app. Two things you make, both applied when a payment is saved:
+
+- **Merged names**: "use *Swiggy* for every payment named *SWIGGY*". Made from a payment's sheet (Edit, change the name, tick "Also rename …").
+- **Category rules**: "if the SMS has *XX4821* and money came in, the category is Self Transfer".
+
+```http
+GET    /api/v1/merchant-names        -> [{id, from_name, to_name, created_at}], newest first
+POST   /api/v1/merchant-names        {"from_name": "SWIGGY", "to_name": "Swiggy"}
+                                     -> 201 {"name": {…}, "changed": 12}  (past payments renamed)
+DELETE /api/v1/merchant-names/{id}   -> 204; past payments keep their new name
+
+GET    /api/v1/rules                 -> [{id, merchant_words, sms_words, min_amount, direction, category, created_at}],
+                                        newest first (the order they're tried in)
+POST   /api/v1/rules/preview         {"sms_words": "XX4821", "direction": "CREDIT", "category": "Self Transfer",
+                                      "merchant_words": null, "min_amount": null, "id": null}
+                                     -> {"count": 6, "examples": [{id, merchant, amount, currency, transaction_time,
+                                        category}]}  (up to 5, newest first; writes nothing)
+POST   /api/v1/rules                 {…the same fields, "apply_to_past": false} -> 201 {"rule": {…}, "changed": 0}
+PUT    /api/v1/rules/{id}            {…every field, "apply_to_past": false} -> {"rule": {…}, "changed": 0}
+DELETE /api/v1/rules/{id}            -> 204; payments it categorised keep their category
+```
+
+All need the dashboard session; writes (the preview included) also need the dashboard `Origin`. Another user's or a missing id gives 404 ("Merged name not found.", "Rule not found."). Amounts are decimal strings (`"15000.00"`). Both live in `merchant_aliases` and `category_rules`, which `create_all` adds on the next start.
+
+**Validation (422).** A merge's `from_name` needs a name: empty or "Unknown" gives "This payment has no name to rename." `to_name` is put in NFC, trimmed and its spaces collapsed, and needs a word, at most 100 characters and no invalid characters ("Enter a merchant name.", "Merchant names can be up to 100 characters.", "Merchant names can't contain invalid characters."). A rule's words are cleaned the same way and an empty one is null; it needs at least one of name words, SMS words or an amount ("Add at least one condition."); words with no letters or digits give "Enter words that appear in the name." / "Enter words that appear in the SMS."; "Words can't contain invalid characters."; "Use up to 255 characters."; an amount of 0 or less, over 9999999999.99 or with more than 2 decimals gives "Enter an amount above zero."; the category must be one of the app's categories other than Uncategorized ("Pick a category from the list."), stored in its usual spelling.
+
+**Matching.** Name words and SMS words match as whole words, in order and next to each other, in **any case** (`merchants.matches_any_case`); anything that isn't a letter or digit splits words, so "rahul@okaxis" matches "to VPA rahul@okaxis on" and "XX4821" matches "A/c XX4821". A smallest amount matches INR payments only, inclusive. Money out or in must equal the payment's direction; none means either. Every condition set must hold. Rules are tried **newest first** (by creation time, then id) and the first match wins, so a narrower rule added after a broad one makes an exception. SMS words never match a payment added by hand (its "Added by hand in Folio" text isn't an SMS). Merchant limits stay case-sensitive.
+
+**Merges** are for one exact name in any case, extra spaces ignored (`categorize.merchant_key`), looked up by a hash so no collation changes which name it's for. Saving one, in one commit: if the new name is itself merged, the merge ends at its final name; the merge is created (or its new name replaced); merges that pointed at this name point at the new one (merges never chain); your category for the name moves to the new name per direction, unless the new name already has one (that one wins); and every past payment of yours (Shortcut SMS included, hand-added ones too) with this name is renamed, unless it's exactly the new name already. A case-only merge ("SWIGGY" → "Swiggy") moves no memory. A "Swiggy" limit then counts the renamed payments.
+
+**Apply to past** is opt-in, after a preview: a rule changes parsed SMS rows (not `manual` or `edited`, whose category you chose) for which it's the first match of your whole list, with it in its place (a rule being edited keeps its place), and whose category differs, so past payments get the answer a new SMS would. Rows the regex parser read also get `parsed_by = "regex+rule"`; Gemini's keep `ai_agent`. Rows are read once and matched in Python; the writes are at most two `UPDATE … WHERE id IN (…) AND updated_at <= :started` in one commit, so nothing is half applied and an edit made meanwhile wins. Merchant memory isn't written. A merge renames the same way.
+
+**Limits.** After a merge or an apply that changed rows, one limit check runs in the background for the newest changed parsed debit; it alerts only for the current week or month, so old payments never do. The app reloads all transactions afterwards (the 5-second poll can't carry hundreds of changed rows).
+
+**Deleting** a merge or a rule stops it for future payments only: names and categories already changed stay. Editing a payment never runs merges or rules again.
 
 ## Spend limits, notifications and (optional) email alerts
 
@@ -202,6 +243,8 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | `GET /api/v1/limits`, with merchant limits | 4: plus one read of your INR debits, matched in Python |
 | Alert check after a debit | as before, +1 to load merchant limits, +1 more when one matches |
 | `PUT /api/v1/limits/merchants` | about 8: the existing limit, the known check, the memory check, the writes, then the summary |
+| SMS webhook | +1 for your merged name and category rules (one statement); a rule that sets the category also saves the Gemini call |
+| `POST /api/v1/transactions` (adding by hand) | +1 for your merged name and category rules (one statement) |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.
 
@@ -273,7 +316,7 @@ Remaining considerations:
 - Configure request-body/rate limits at the public reverse proxy, use stable HTTPS, and introduce migrations when models change (`create_all` does not migrate existing columns).
 - `GET /api/v1/dashboard` was removed (nothing called it; the app computes its totals from `/api/v1/transactions`). Queue ingestion if volume increases.
 - Hash deduplication treats identical normalized SMS text as the same event. Distinct identical messages require a bank/event identifier to distinguish them. Differently worded SMS of one payment are saved, then flagged as possible duplicates and held out of totals (see Possible duplicates).
-- Parsing order: regex (tuned for HDFC/ICICI account, card and UPI alerts; the earliest debit/credit keyword decides direction, and balance/limit/due amounts are never used as the transaction amount) → Gemini full parse if regex cannot find a type and amount → Gemini category-only call if regex parsed it but no keyword rule matched (`parsed_by=regex+ai`) → `Uncategorized`. Categories are listed in `parser.CATEGORIES`.
+- Parsing order: regex (tuned for HDFC/ICICI account, card and UPI alerts; the earliest debit/credit keyword decides direction, and balance/limit/due amounts are never used as the transaction amount) → Gemini full parse if regex cannot find a type and amount → your merged names and category rules (`parsed_by=regex+rule`) → your category for the merchant, earlier payments → Gemini category-only call if regex parsed it but no keyword rule matched (`parsed_by=regex+ai`) → `Uncategorized`. Categories are listed in `parser.CATEGORIES`.
 - Bank formats vary. The parser uses the first currency-labelled amount that is not a balance/limit; it does not extract embedded SMS dates. `received_at` (or receipt time) drives the dashboard date. Verify your bank's formats.
 - On regex failure, the existing Gemini integration sends the SMS to Google. Remove `GEMINI_API_KEY` to preserve unmatched messages locally for review instead. Set `GEMINI_MODEL` to one available to your account; the original model default is retained. Editing review records is outside this read-only dashboard.
 

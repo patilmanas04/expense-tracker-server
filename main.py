@@ -20,7 +20,9 @@ from database import get_db, init_db
 from models import Transaction, User
 import categorize
 import duplicates
-from parser import CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, compute_message_hash, detect_category, parse_sms
+import rules
+from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
+                    detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, owner_balance, router as balance_router
 from limits import check_spend_limits, router as limits_router
@@ -68,6 +70,8 @@ app.include_router(auth_router)
 app.include_router(balance_router)
 app.include_router(limits_router)
 app.include_router(notifications_router)
+app.include_router(rules.names_router)
+app.include_router(rules.rules_router)
 
 
 @app.middleware("http")
@@ -181,7 +185,9 @@ async def ingest_sms_webhook(
     1. Validates authentication token.
     2. Hashes message to guarantee idempotency and prevent duplicate entries.
     3. Parses SMS with fast Regex rules, falling back to Gemini AI Agent if uncertain
-       (full parse when regex fails, category only when regex cannot categorize).
+       (full parse when regex fails, category only when regex cannot categorize). Your merged names
+       and category rules (rules.py, one query) come first: the merchant is saved under its merged
+       name, and a matching rule sets the category without a Gemini call.
     4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible), and flags a possible duplicate of
        an earlier transaction in the same commit (duplicates.py); a flagged one is held out of totals.
     5. Returns the updated running balance when one is set in Settings.
@@ -220,7 +226,17 @@ async def ingest_sms_webhook(
             await db.rollback()  # an aborted transaction would stop the SMS being saved
             raise
 
-    parsed: ParsedTransaction = await parse_sms(raw_text, payload.sender, recall=recall)
+    async def apply_rules(merchant: Optional[str], sms_text: str, amount: Decimal, currency: str,
+                          tx_type: str) -> RuleOutcome:
+        try:
+            to_name, category_rules = await rules.load_owner_rules(db, categorize._owner_id(None), merchant)
+        except Exception:
+            await db.rollback()  # an aborted transaction would stop the SMS being saved
+            raise
+        hit = rules.first_match(category_rules, to_name or merchant, sms_text, amount, currency, tx_type)
+        return RuleOutcome(to_name, hit.category if hit else None)
+
+    parsed: ParsedTransaction = await parse_sms(raw_text, payload.sender, recall=recall, apply_rules=apply_rules)
     if parsed.parsed_by == "ignored":
         return WebhookResponse(status="ignored", message="Message is not a completed transaction.")
 
@@ -406,22 +422,30 @@ async def add_transaction(
     db: AsyncSession = Depends(get_db),
 ):
     """For cash and anything without an SMS. Counts in totals and spend limits like an SMS;
-    cash entries don't change the bank balance. A category you pick is remembered for the merchant;
-    "Auto" uses that memory, the keyword rules, then Gemini in the background. A possible duplicate of
-    an SMS is held out of totals until you decide (duplicates.py)."""
+    cash entries don't change the bank balance. The name becomes your merged name for it, if any
+    (rules.py). A category you pick is kept and remembered for the (merged) merchant; "Auto" uses your
+    category rules (never ones with SMS words: there's no SMS), then that memory, the keyword rules,
+    then Gemini in the background. A possible duplicate of an SMS is held out of totals until you
+    decide (duplicates.py)."""
     now = datetime.now(timezone.utc)
+    to_name, category_rules = await rules.load_owner_rules(db, user.id, body.merchant)
+    merchant = to_name or body.merchant
     if body.category:
         category = body.category
-        await categorize.remember(db, user.id, body.merchant, body.type, category)
+        await categorize.remember(db, user.id, merchant, body.type, category)
     else:
-        keyword = detect_category(body.merchant, tx_type=body.type)
-        category = await categorize.auto_category(db, user.id, body.merchant, body.type, keyword)
+        hit = rules.first_match(category_rules, merchant, None, body.amount, "INR", body.type)
+        if hit:
+            category = hit.category
+        else:
+            keyword = detect_category(merchant, tx_type=body.type)
+            category = await categorize.auto_category(db, user.id, merchant, body.type, keyword)
     txn = Transaction(
         user_id=user.id,
         type=body.type,
         amount=body.amount,
         currency="INR",
-        merchant=body.merchant,
+        merchant=merchant,
         category=category,
         account_ref=CASH_ACCOUNT if body.paid_with == "cash" else None,
         raw_message="Added by hand in Folio",

@@ -7,6 +7,9 @@ whole words, with the same upper and lower case: "Swiggy" counts "Swiggy" and "S
 (MySQL compares without case by default) can change the answer. Names are compared in Unicode NFC,
 so an accented letter typed as one character or as a letter plus a combining accent is the same.
 
+Category rules (rules.py) use the same whole-word match without case, "matches_any_case": a rule for
+"swiggy" matches "SWIGGY Ltd". Limits stay case-sensitive.
+
 "share_word" is the loose name rule for matching a notice or a refund to a payment: two texts match when
 they share one meaningful word, in any case.
 """
@@ -62,13 +65,28 @@ def words(name: Optional[str]) -> list[str]:
     return [word for word in found if any(c.isalnum() for c in word)]
 
 
+def _contains(wanted: list[str], have: list[str]) -> bool:
+    # The wanted words appear in `have`, in order and next to each other.
+    size = len(wanted)
+    return any(have[i:i + size] == wanted for i in range(len(have) - size + 1))
+
+
 def matches(limit_name: str, name: Optional[str]) -> bool:
     """True when the limit's words appear, in order and next to each other, among the name's."""
     wanted, have = words(limit_name), words(name)
     if not wanted:
         return False
-    size = len(wanted)
-    return any(have[i:i + size] == wanted for i in range(len(have) - size + 1))
+    return _contains(wanted, have)
+
+
+def matches_any_case(phrase: str, text: Optional[str]) -> bool:
+    """`matches` with both word lists case-folded: category rules use it for name and SMS words
+    ("rahul@okaxis" matches "to VPA RAHUL@okaxis on"); limits stay case-sensitive. A phrase with no
+    words ("@@", "Unknown") matches nothing."""
+    wanted = [word.casefold() for word in words(phrase)]
+    if not wanted:
+        return False
+    return _contains(wanted, [word.casefold() for word in words(text)])
 
 
 def name_hash(name: str) -> str:

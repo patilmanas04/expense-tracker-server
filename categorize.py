@@ -1,9 +1,14 @@
 """Where a transaction's category comes from, in order:
 
+0. your merged names and category rules (rules.py): the merchant becomes its merged name first, and a
+   category rule that matches decides the category, skipping everything below,
 1. the category you picked for the merchant (editing or adding a transaction remembers it),
 2. the bank-SMS keyword rules (parser.py),
 3. the category of your latest earlier payment to the same merchant (never Self Transfer: only a category you
-   picked carries that to the next payment),
+   picked carries that to the next payment; never one a category rule set on an SMS the regex parser read,
+   `parsed_by` "regex+rule": its conditions decide, so a rule for rent of ₹15,000 or more doesn't spread to a
+   ₹300 payment to the same person. A rule's category on a payment added by hand ("manual") or read by Gemini
+   ("ai_agent") has no marker, so those rows still count here, like any category they carry),
 4. Gemini. If Gemini is too slow while the SMS is being saved, it's saved Uncategorized and
    `retry_ai_category` fills the category in the background with more time.
 
@@ -62,6 +67,7 @@ async def recall_category(db: AsyncSession, merchant: Optional[str], tx_type: st
         Transaction.category.is_not(None),
         Transaction.category != UNCATEGORIZED,
         Transaction.category != "Self Transfer",
+        Transaction.parsed_by != "regex+rule",  # a rule's category holds only where its conditions do (SMS rows only)
     ).order_by(Transaction.updated_at.desc(), Transaction.transaction_time.desc()).limit(1).scalar_subquery()
     row = (await db.execute(select(chosen.label("chosen"), earlier.label("earlier")))).one()
     if row.chosen:

@@ -168,7 +168,7 @@ class Transaction(Base):
         String(50),
         default="regex",
         nullable=False,
-    )  # "regex" or "ai_agent"
+    )  # "regex", "regex+user", "regex+history", "regex+ai", "regex+rule", "ai_agent", "manual", "edited" or "failed"
     notes: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,
@@ -649,6 +649,105 @@ class DuplicateFlag(Base):
         DateTime(timezone=True),
         nullable=True,
     )  # set by "Not a duplicate"
+
+
+class MerchantAlias(Base):
+    """A merged name: every payment named `from_name` (any case, extra spaces ignored) is saved and
+    shown as `to_name` (rules.py). Applied on write: past payments are renamed when it's saved."""
+
+    __tablename__ = "merchant_aliases"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    from_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # the name as you saw it ("SWIGGY"), cleaned; for display
+    from_key: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )  # categorize.merchant_key(from_name): lower case, single spaces
+    from_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )  # SHA-256 of `from_key` (merchants.name_hash)
+    to_name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )  # the merged name, cleaned like a typed merchant name
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # Unique on the hash, as for MerchantLimit: no database collation changes which name a merge is for.
+    __table_args__ = (
+        UniqueConstraint("user_id", "from_hash", name="uq_merchant_alias"),
+    )
+
+
+class CategoryRule(Base):
+    """A category rule: payments matching every condition set (words in the name, words in the SMS, a
+    smallest INR amount, money out or in) get its category. The newest matching rule wins (rules.py)."""
+
+    __tablename__ = "category_rules"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    merchant_words: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )  # words in the merchant name
+    sms_words: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+    )  # words in the SMS text
+    min_amount: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+    )  # INR, inclusive
+    direction: Mapped[Optional[str]] = mapped_column(
+        String(6),
+        nullable=True,
+    )  # "DEBIT" or "CREDIT"; None = either
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )  # never Uncategorized
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )  # newest first decides the order
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
 
 
 # The original's id while the flag is pending, else None: every TransactionResponse carries it (one

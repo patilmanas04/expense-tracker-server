@@ -45,8 +45,8 @@ class ParsedTransaction(BaseModel):
     is_parsed: bool = Field(default=True)
     parsed_by: str = Field(
         default="regex",
-        description="'regex', 'regex+ai' (AI category), 'regex+user' (your category for the merchant), "
-                    "'regex+history' (from earlier payments to it) or 'ai_agent'",
+        description="'regex', 'regex+rule' (one of your category rules), 'regex+user' (your category for the "
+                    "merchant), 'regex+history' (from earlier payments to it), 'regex+ai' (AI category) or 'ai_agent'",
     )
     confidence: float = Field(default=1.0, description="Confidence score from 0.0 to 1.0")
     ai_category_pending: bool = Field(default=False, description="Gemini was too slow; categorise in the background")
@@ -61,6 +61,17 @@ class Recalled(NamedTuple):
 
 # Looks up a remembered category for (merchant, DEBIT/CREDIT); the parser stays free of database code.
 Recall = Callable[[Optional[str], str], Awaitable[Optional[Recalled]]]
+
+
+class RuleOutcome(NamedTuple):
+    """What your merged names and category rules (rules.py) say about a payment."""
+
+    merchant: Optional[str] = None  # the merged name, or None
+    category: Optional[str] = None  # a category rule's category, or None
+
+
+# Applies your merged names and category rules to (merchant, SMS text, amount, currency, DEBIT/CREDIT).
+ApplyRules = Callable[[Optional[str], str, Decimal, str, str], Awaitable[RuleOutcome]]
 
 
 # Category keywords mapping for rule-based categorization (matched on whole words)
@@ -636,13 +647,27 @@ async def _recall(recall: Optional[Recall], parsed: ParsedTransaction) -> Option
         return None
 
 
-async def parse_sms(sms_text: str, sender: Optional[str] = None, recall: Optional[Recall] = None) -> ParsedTransaction:
+async def _apply_rules(apply_rules: Optional[ApplyRules], parsed: ParsedTransaction, sms_text: str) -> RuleOutcome:
+    if apply_rules is None:
+        return RuleOutcome()
+    try:
+        return await apply_rules(parsed.merchant, sms_text, parsed.amount, parsed.currency, parsed.type)
+    except Exception:
+        logger.warning("Rules unavailable; saving without them")  # never lose an SMS over them
+        return RuleOutcome()
+
+
+async def parse_sms(sms_text: str, sender: Optional[str] = None, recall: Optional[Recall] = None,
+                    apply_rules: Optional[ApplyRules] = None) -> ParsedTransaction:
     """Master SMS parser: Runs fast regex first; falls back to Gemini if regex fails
     or cannot extract core fields (amount, type).
 
-    The category comes from, in order: the category you picked for the merchant, the keyword
-    rules, earlier payments to the merchant (both via `recall`), then Gemini. If Gemini is too
-    slow it stays Uncategorized for now, flagged `ai_category_pending` for a background retry.
+    The merchant becomes your merged name for it, if any (via `apply_rules`; keywords run again on the
+    merged name when the bank's name had none). The category comes from, in order: your category rules
+    (`apply_rules`, parsed_by 'regex+rule', no Gemini call), the category you picked for the merchant,
+    the keyword rules, earlier payments to the merchant (both via `recall`), then Gemini. If Gemini is
+    too slow it stays Uncategorized for now, flagged `ai_category_pending` for a background retry. After
+    a Gemini full parse the merged name and a rule's category still apply (parsed_by stays 'ai_agent').
     """
     if is_non_transaction(sms_text):
         return _ignored()
@@ -654,11 +679,20 @@ async def parse_sms(sms_text: str, sender: Optional[str] = None, recall: Optiona
         logger.warning("Regex parser could not validate the message")
 
     if regex_result and regex_result.amount > 0:
-        # 2. Your category for this merchant, or (when the rules found none) earlier payments to it
+        # 2. Your merged name, then your category rules
+        outcome = await _apply_rules(apply_rules, regex_result, sms_text)
+        if outcome.merchant:
+            changes = {"merchant": outcome.merchant}
+            if regex_result.category == UNCATEGORIZED:  # "Amazonpayindiap" merged into "Amazon" is Shopping
+                changes["category"] = detect_category(outcome.merchant, sms_text, regex_result.type)
+            regex_result = regex_result.model_copy(update=changes)
+        if outcome.category:
+            return regex_result.model_copy(update={"category": outcome.category, "parsed_by": "regex+rule"})
+        # 3. Your category for this merchant, or (when the rules found none) earlier payments to it
         remembered = await _recall(recall, regex_result)
         if remembered and (remembered.source == "user" or regex_result.category == UNCATEGORIZED):
             return regex_result.model_copy(update={"category": remembered.category, "parsed_by": f"regex+{remembered.source}"})
-        # 3. Category fallback to Gemini
+        # 4. Category fallback to Gemini
         if regex_result.category == UNCATEGORIZED and os.getenv("GEMINI_API_KEY"):
             try:
                 category = await categorize_with_gemini(sms_text, regex_result.merchant, regex_result.type)
@@ -676,6 +710,11 @@ async def parse_sms(sms_text: str, sender: Optional[str] = None, recall: Optiona
             return ai_result
         if ai_result.amount <= 0:
             raise ValueError("No positive transaction amount")
+        outcome = await _apply_rules(apply_rules, ai_result, sms_text)
+        if outcome.merchant:
+            ai_result = ai_result.model_copy(update={"merchant": outcome.merchant})
+        if outcome.category:  # a rule beats Gemini's guess and your memory
+            return ai_result.model_copy(update={"category": outcome.category})
         remembered = await _recall(recall, ai_result)
         if remembered and remembered.source == "user":
             ai_result = ai_result.model_copy(update={"category": remembered.category})
