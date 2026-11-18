@@ -132,13 +132,25 @@ Set your current bank balance in the dashboard's Settings. From that moment, eve
 ```http
 GET    /api/v1/balance            -> summary, or null if not set
 GET    /api/v1/balance/breakdown  -> breakdown, or 404 "No balance set."
+GET    /api/v1/balance/safe-to-spend  -> safe to spend, or 404 "No balance set."
 PUT    /api/v1/balance            {"amount": "125000.50"}   (optional "as_of": ISO time with timezone)
 DELETE /api/v1/balance
 ```
 
-All four require the dashboard session. `PUT`/`DELETE` also require the dashboard `Origin`. When a balance is set, `success` and `duplicate` webhook responses include `balance` (`current`, `spent`, `received`, `excluded_card`, …). In Shortcuts you can add **Get Dictionary Value** `balance` → `current` and **Show Notification** "Balance left: …" after each SMS.
+All five require the dashboard session. `PUT`/`DELETE` also require the dashboard `Origin`. When a balance is set, `success` and `duplicate` webhook responses include `balance` (`current`, `spent`, `received`, `excluded_card`, …). In Shortcuts you can add **Get Dictionary Value** `balance` → `current` and **Show Notification** "Balance left: …" after each SMS.
 
 The breakdown (the app's **How it's worked out**) lists every transaction of yours (or unassigned) recorded after `as_of`, in any parse state and currency. `balance.classify` gives each one at most one reason it was skipped, the first that matches in this fixed order: `unreadable` (needs review), `other_currency`, `duplicate` (held out), `cash`, `credit_card`; a row with no reason is counted. The response has `currency`, `start` (`amount`, `as_of`), `counted` (oldest first: `{id, effect, running}`, the signed effect and the balance right after it), `skipped` (all five groups, each `{count, total, ids}`, ids oldest first; `total` is the signed net the rows would have had, `"0.00"` when empty, and always `null` for `unreadable` and `other_currency`) and `current`, which equals the summary's `current`. Order is `transaction_time`, then `created_at`, then `id`. Amounts are decimal strings with two places (`"-1249.00"`). `PUT`'s `as_of` is the app's **Read at**: the moment you read the balance in your bank's app, so payments between then and saving still count. It can be any past time (at most 5 minutes ahead); the app limits it to the last 7 days, the server doesn't.
+
+**Safe to spend** (`safe_to_spend.py`, the app's Settings → Bank balance row) is Balance left minus what is still due to leave the bank before the next payday: `safe = balance − Σ subtracted`, worked out on every read (nothing stored, no new table).
+
+- **Next payday** reuses the SMS watchdog's rule: with at least 2 salary days (`pay_periods.salary_days`, category Salary) in the last 120 days (`watchdog.SALARY_MIN`, `watchdog.SALARY_WINDOW`), it's the usual payday after the newest salary (`pay_periods.expected_after(days, usual_offset(days))`). `payday_state` is `upcoming` when that date is after today, `today` when it is today and `late` when it has passed without a salary. Otherwise it's `month_end` and the next payday is the 1st of next month.
+- **Which due dates count** (`until`, inclusive, not returned): `upcoming` → the day before payday; `today` and `late` → today; `month_end` → the last day of this month.
+- **Items** are every Upcoming payments item up to `until` (`upcoming.list_upcoming`: notices not dismissed due from 7 days ago, expected payments of recurring series, late ones included), in its order. Each is checked in this order: one that doesn't leave the bank (`leaves_bank` false: a card-charged auto-debit, a series paid by card or in cash) subtracts 0 with note `card_or_cash`; a card bill subtracts what is still owed, `amount − paid_amount`, or 0 with note `paid` when nothing is left (its status is ignored: "paid" there only means the minimum was reached); otherwise `upcoming` and `late` items subtract their amount and `paid` / `not_seen` ones subtract 0 with their status as the note. The app lists an item under **Not subtracted** exactly when `note` is set.
+- **Per day:** `per_day = floor(safe / days)` in whole rupees, only when `safe > 0` and the state is `upcoming` or `month_end`; otherwise `null`. `safe` may be negative (short).
+- **Response:** `currency` (the balance's), `balance` (Balance left), `next_payday` (`YYYY-MM-DD`, IST), `payday_state`, `days` (days from today to payday for `upcoming` and `month_end`, at least 1; `null` for `today` and `late`), `due` (each `{date, payee, kind, status, amount, min_amount, paid_amount, subtracted, note}`), `safe`, `per_day`. Amounts are decimal strings with two places, never `"-0.00"`. Read-only, so no `Origin` check; 404 "No balance set." without a saved balance.
+- **Cost:** 6–8 statements (the balance setting, the balance sum, salary days, then Upcoming payments' 3–5), only while the app's Settings is open.
+
+Tests: `tests/test_safe_to_spend.py` (the payday rule and its states, the item rules, CUJs, boundaries, statement counts and the API).
 
 Every transaction response carries `balance_kind`: `null` when the SMS has no balance, else `"bank"` when its "Avl Bal" is a bank account's and `"card"` when it is a credit card's limit left. It uses the same test as Balance left, so a card bill paid from the bank reads `"bank"`.
 
@@ -491,6 +503,7 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | `GET /api/v1/recurring` | 2 after the session: your debits in the window (4 columns), then your decisions |
 | `GET /api/v1/upcoming` | 3–5: notices, then your payments since the earliest open notice (only when one is open), recurring's 2, then the newest payment of each expected series (only when one is listed) |
 | Card-bill reminder (daily job) | the same 3–5, +2 per new notification |
+| `GET /api/v1/balance/safe-to-spend` | 6–8: the balance setting, the balance sum, your salary days, then the same 3–5 as Upcoming payments |
 | Recurring check after a debit (background) | 1 (your debits in the window), +1 for decisions when the payment is the newest of a series, +2 for a notification |
 
 Mail is sent with the **Gmail API** using OAuth and only the `gmail.send` scope, so Folio can send as you but can't read your mail.

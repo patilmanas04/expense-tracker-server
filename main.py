@@ -29,6 +29,7 @@ import payment_alerts
 import post_save
 import recurring
 import rules
+import safe_to_spend
 import settings_store
 import upcoming
 import watchdog
@@ -103,6 +104,7 @@ app.include_router(rules.rules_router)
 app.include_router(settings_store.router)
 app.include_router(recurring.router)
 app.include_router(upcoming.router)
+app.include_router(safe_to_spend.router)
 
 
 @app.middleware("http")
