@@ -6,6 +6,9 @@ whole words, with the same upper and lower case: "Swiggy" counts "Swiggy" and "S
 "SWIGGY", "swiggy" or "Swiggyone". Matching runs in Python so no database's text comparison rules
 (MySQL compares without case by default) can change the answer. Names are compared in Unicode NFC,
 so an accented letter typed as one character or as a letter plus a combining accent is the same.
+
+"share_word" is the loose name rule for matching a notice or a refund to a payment: two texts match when
+they share one meaningful word, in any case.
 """
 import hashlib
 import unicodedata
@@ -111,3 +114,26 @@ def meter(limit_name: str, rows: Iterable[tuple[Optional[str], Decimal, datetime
     cents = Decimal("0.01")
     return (spent["weekly"].quantize(cents), spent["monthly"].quantize(cents),
             [name for name, _ in _by_payments(counted)])
+
+
+# Words that say nothing about who was paid: banks, company suffixes, payment and SMS boilerplate, the
+# text of a transaction added by hand ("Added by hand in Folio") and the placeholder for an unread SMS.
+COMMON_WORDS = frozenset({
+    "bank", "hdfc", "icici", "sbi", "axis", "kotak", "india", "pvt", "ltd", "limited", "private",
+    "payment", "payments", "services", "service", "the", "and", "for", "upi", "autopay", "mandate",
+    "card", "credit", "debit", "debited", "account", "towards", "from", "your", "dear", "customer",
+    "added", "hand", "folio", "com", "www", "inr", "unknown",
+})
+
+
+def _meaningful_words(text: Optional[str]) -> set[str]:
+    # Words of 3+ characters with a letter, compared without case, common words left out.
+    return {word.casefold() for word in words(text) if len(word) >= 3 and any(c.isalpha() for c in word)} - COMMON_WORDS
+
+
+def share_word(a: Optional[str], b: Optional[str]) -> bool:
+    """True when the two texts share a meaningful word: 3+ characters with a letter, compared without case,
+    not in COMMON_WORDS. "NETFLIX" and "Netflix Upi" match; "HDFC Bank" and "HDFC Bank Credit Card" don't.
+    Callers may pass a merchant joined with its SMS text, so a payment whose merchant wasn't read still
+    matches on the SMS."""
+    return bool(_meaningful_words(a) & _meaningful_words(b))

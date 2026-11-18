@@ -242,7 +242,7 @@ Implemented:
 - Fixed truncation of four-plus-digit amounts and added Indian comma grouping for amounts/balances.
 - Atomic duplicate-insert recovery for concurrent retries using the existing unique hash constraint.
 - Removed raw SMS logging; bounded input lengths and timezone validation.
-- Ignored obvious OTP, failed/declined payment, scheduled debit and payment-request messages.
+- Ignored obvious OTP, failed/declined payment, payment-request and offer messages, and notices of money that hasn't moved yet: auto-debit / AutoPay pre-debit alerts ("is scheduled on", "will be debited", "due on/by") and card statements or bill reminders ("total/minimum due", "statement … generated"). A notice that also says the money moved ("debited via UPI AutoPay") is still recorded.
 - Retained successful regex parsing when merchant is missing, avoiding unnecessary AI requests.
 - Asynchronous Gemini calls with a 20-second timeout, validated fields and safe fallback after parser errors.
 - Excluded unparsed transactions from analytics and omitted raw SMS from the dashboard response.

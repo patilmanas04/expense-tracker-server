@@ -138,11 +138,17 @@ CONTEXT_RULES = [
     ("Transfer", None, r"\b(?:neft|imps|rtgs|inft|trf|money transfer|fund transfer)\b|\bto a/c\b"),
 ]
 
+# Requests and offers to approve something: OTPs, collect/payment requests, pre-approved loans. notices.py
+# rejects these too, so "a request" has one definition.
+REQUEST_PATTERN = (
+    r"\b(?:otp|one.time password|verification code|payment request|collect request|"
+    r"has requested|requested money|pre-?approved|apply now)\b"
+)
+REQUEST_RE = re.compile(REQUEST_PATTERN, re.IGNORECASE)
 # Messages that mention money but are not a completed transaction.
 IGNORE_RE = re.compile(
-    r"\b(?:otp|one.time password|verification code|payment request|collect request|"
-    r"has requested|requested money|will be (?:debited|credited|deducted|charged)|to be debited|"
-    r"due date|payment due|is due|pre-?approved|apply now|"
+    REQUEST_PATTERN + r"|\b(?:will be (?:debited|credited|deducted|charged)|to be debited|"
+    r"due date|payment due|is due|"
     # Settlement confirmations for transfers already recorded by the debit alert
     r"credited to the beneficiary|money deposited)\b",
     re.IGNORECASE,
@@ -159,6 +165,16 @@ PROMO_RE = re.compile(
 # Wording that only appears once money has actually moved; it overrides PROMO_RE.
 COMPLETED_RE = re.compile(
     r"\b(?:credited|debited|deducted|spent|sent|received|paid|withdrawn|transferred|refunded|reversed)\b",
+    re.IGNORECASE,
+)
+# Notices of money that will leave later: auto-debit / AutoPay pre-debit alerts and card statements or
+# bill reminders ("debit of Rs 649.00 is scheduled on 12-Dec-26", "Total due ... Min due ... due by").
+# Ignored unless the SMS also has a completed-action word (COMPLETED_RE), so "Rs 649.00 debited via UPI
+# AutoPay" and "refund ... credited ... Revised total due" stay transactions.
+NOTICE_RE = re.compile(
+    r"\b(?:is|are) scheduled (?:on|for)\b|\bwill be (?:debited|deducted|charged)\b|\bto be debited\b|"
+    r"\bdue (?:on|by)\b|\b(?:total|min(?:imum)?)\.?\s+(?:amo?u?n?t\.?\s+)?due\b|"
+    r"\bstatement\b[^.\n]{0,40}\bgenerated\b",
     re.IGNORECASE,
 )
 REVERSAL_RE = re.compile(r"\b(?:refund(?:ed)?|reversed|reversal|credited back)\b", re.IGNORECASE)
@@ -599,10 +615,12 @@ def _ignored() -> ParsedTransaction:
 
 
 def is_non_transaction(sms_text: str) -> bool:
-    """OTPs, failed payments, payment requests, future debits and offers are not completed transactions."""
+    """OTPs, failed payments, payment requests, offers and notices of future debits or card bills are not completed transactions."""
     if IGNORE_RE.search(sms_text):
         return True
     if PROMO_RE.search(sms_text) and not COMPLETED_RE.search(sms_text):
+        return True
+    if NOTICE_RE.search(sms_text) and not COMPLETED_RE.search(sms_text):
         return True
     # "Refund for failed txn credited" is real money in; a bare "txn failed" is not.
     return bool(FAILED_RE.search(sms_text)) and not REVERSAL_RE.search(sms_text)

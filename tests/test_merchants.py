@@ -169,5 +169,49 @@ class MeterTests(unittest.TestCase):
         self.assertEqual(merchants.meter("Unknown", [("Unknown", 5, WEEK_START)], WINDOWS)[2], [])
 
 
+
+class ShareWordTests(unittest.TestCase):
+    """The loose rule for matching a notice or a refund to a payment: one shared meaningful word, any case."""
+    def assertShare(self, pairs, expected):
+        for a, b in pairs:
+            with self.subTest(a=a, b=b):
+                self.assertEqual(merchants.share_word(a, b), expected)
+                self.assertEqual(merchants.share_word(b, a), expected)
+
+    def test_shared_words(self):
+        self.assertShare([
+            ("NETFLIX", "Netflix Upi"),
+            ("Netflix Entertainment Services", "Netflix.com"),
+            ("Netflix", "Rs 649.00 debited via UPI AutoPay from A/c XX1234 to NETFLIX"),
+            ("Café Coffee Day", "CAFÉ"),
+            ("स्विगी", "स्विगी इंस्टामार्ट"),
+        ], True)
+
+    def test_common_words_never_match(self):
+        self.assertShare([
+            ("HDFC Bank", "HDFC Bank Credit Card"),
+            ("HDFC Bank", "Rs 649.00 debited from HDFC Bank A/c XX1234"),
+            ("Amazon.com", "Netflix.com"),
+            ("Unknown", "Unknown Rs 500 debited"),
+            ("Netflix", "Added by hand in Folio"),
+        ], False)
+
+    def test_whole_words_of_three_or_more_with_a_letter(self):
+        self.assertShare([("Ola", "Kolar Stores"), ("Vi", "Vi Recharge"), ("7001", "Card 7001"), ("Netflix", "Spotify")], False)
+
+    def test_missing_text(self):
+        for a, b in [(None, "Netflix"), ("Netflix", None), ("", ""), (None, None)]:
+            with self.subTest(a=a, b=b):
+                self.assertFalse(merchants.share_word(a, b))
+
+    def test_common_words_are_casefolded(self):
+        for word in merchants.COMMON_WORDS:
+            with self.subTest(word=word):
+                self.assertEqual(word, word.casefold())
+                self.assertNotIn(" ", word)
+        for word in ("hdfc", "autopay", "folio", "com"):
+            self.assertIn(word, merchants.COMMON_WORDS)
+
+
 if __name__ == "__main__":
     unittest.main()

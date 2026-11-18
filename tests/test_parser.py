@@ -9,7 +9,7 @@ import unittest
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
-from parser import CATEGORIES, normalize_category, parse_sms, parse_sms_with_regex
+from parser import CATEGORIES, REQUEST_RE, is_non_transaction, normalize_category, parse_sms, parse_sms_with_regex
 
 # (sms, type, amount, balance, account_ref, reference_id, merchant, category)
 BANK_SMS = [
@@ -79,6 +79,11 @@ NOT_TRANSACTIONS = [
     "RTGS Money Deposited~INR 2,00,000.00~To SAMPLE NAME~Txn No: HDFCR000111~On 21-10-2026~-HDFC Bank",
 ]
 
+AUTOPAY_NOTICE = "AutoPay for NETFLIX, debit of Rs 649.00 is scheduled on 12-Dec-26. Mandate ID HDFC0000XYZ. -HDFC Bank"
+CARD_STATEMENT = "Statement for ICICI Bank Credit Card XX7001 generated. Total due Rs 4,500.00 Min due Rs 500.00 due by 05-Dec-26"
+AUTOPAY_DEBIT = "Rs 649.00 debited via UPI AutoPay from A/c XX1234 to NETFLIX"
+NOT_TRANSACTIONS += [AUTOPAY_NOTICE, CARD_STATEMENT]
+
 
 class BankFormatTests(unittest.TestCase):
     def test_hdfc_and_icici_formats(self):
@@ -147,6 +152,57 @@ class IgnoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_refund_of_failed_transaction_is_recorded(self):
         p = await parse_sms("Rs.500 credited to HDFC Bank A/c XX1234 as refund for failed UPI txn 629400001234")
         self.assertEqual((p.type, p.amount, p.category), ("CREDIT", Decimal(500), "Refunds & Cashback"))
+
+
+class NoticeTests(unittest.IsolatedAsyncioTestCase):
+    """Auto-debit notices and card statements say money will leave later; only the debit itself is a transaction."""
+    def test_bank_sms_are_not_notices(self):
+        for row in BANK_SMS:
+            with self.subTest(sms=row[0][:60]):
+                self.assertFalse(is_non_transaction(row[0]))
+
+    async def test_notices_are_ignored_without_asking_ai(self):
+        notices = [
+            AUTOPAY_NOTICE,
+            CARD_STATEMENT,
+            "Total Amount Due INR 4,500; Minimum Amount Due INR 500; Payment due date 05-Dec-26 for ICICI Bank Credit Card XX7001",
+            "Your HDFC Bank Credit Card XX9012 statement has been generated. Total Amt Due Rs 4,500 Min Amt Due Rs 500 Due by 05-Dec-26",
+            "Rs 649 will be debited from your HDFC Bank A/c XX1234 tomorrow towards NETFLIX",
+            "Your SIP of Rs 5,000 is scheduled for 05-Dec-26 via NACH mandate",
+        ]
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), \
+                patch("parser.categorize_with_gemini", new_callable=AsyncMock) as ai, \
+                patch("parser.parse_sms_with_gemini", new_callable=AsyncMock) as full_ai:
+            for sms in notices:
+                with self.subTest(sms=sms[:60]):
+                    self.assertEqual((await parse_sms(sms)).parsed_by, "ignored")
+        ai.assert_not_called()
+        full_ai.assert_not_called()
+
+    async def test_completed_autopay_debit_still_counts(self):
+        p = await parse_sms(AUTOPAY_DEBIT)
+        self.assertEqual((p.type, p.amount, p.is_parsed, p.parsed_by), ("DEBIT", Decimal("649.00"), True, "regex"))
+
+    def test_completed_word_vetoes_notice_wording(self):
+        for sms, amount in [
+            ("Rs 5,000.00 debited from HDFC Bank A/c XX4821 towards EMI. Next EMI due on 05-Jan-27", "5000.00"),
+            ("Rs.649.00 debited from a/c XX1234 on 12-12-26 to NETFLIX. UPI AutoPay mandate ID ABC. Next debit is scheduled on 12-01-27", "649.00"),
+        ]:
+            with self.subTest(sms=sms[:60]):
+                self.assertFalse(is_non_transaction(sms))
+                p = parse_sms_with_regex(sms)
+                self.assertEqual((p.type, p.amount), ("DEBIT", Decimal(amount)))
+
+    def test_request_re(self):
+        priya, pre_approved = (next(sms for sms in NOT_TRANSACTIONS if start in sms) for start in ("PRIYA", "pre-approved"))
+        requests = ["OTP 123456 for INR 500 purchase", priya, pre_approved,
+                    "Collect request of Rs 200 from abc@ybl", "Your verification code is 1234"]
+        for sms in requests:
+            with self.subTest(sms=sms[:60]):
+                self.assertTrue(REQUEST_RE.search(sms))
+        for sms in [AUTOPAY_NOTICE, CARD_STATEMENT, "INR 500 payment failed"] + [row[0] for row in BANK_SMS]:
+            with self.subTest(sms=sms[:60]):
+                self.assertIsNone(REQUEST_RE.search(sms))
 
 
 class SalaryAndIncomeTests(unittest.TestCase):
