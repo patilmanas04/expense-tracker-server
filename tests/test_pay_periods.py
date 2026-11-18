@@ -1,5 +1,5 @@
 """Pay periods (pay_periods.py): the name rule, building periods, the expected last day, the monthly and previous
-windows, salary days, loading with its statement count, and GET /api/v1/periods. Isolated in-memory SQLite; no
+windows, the usual payday, salary days, loading with its statement count, and GET /api/v1/periods. Isolated in-memory SQLite; no
 mail, no Gemini."""
 import os
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///:memory:"
@@ -25,7 +25,8 @@ from auth import current_user
 from database import AsyncSessionLocal, Base, engine
 from main import app
 from models import DUPLICATE_PENDING, DuplicateFlag, Transaction, User
-from pay_periods import PayPeriod, build, expected_last_day, monthly_window, previous_window, salary_month
+from pay_periods import (PayPeriod, build, day_offset, expected_after, expected_last_day, monthly_window, payday_in,
+                         previous_window, salary_month, usual_offset)
 
 ORIGIN = {"Origin": "http://localhost:3000"}
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -48,6 +49,39 @@ class NameTests(unittest.TestCase):
                           (d(2027, 1, 16), "2027-02")):
             with self.subTest(day=day):
                 self.assertEqual(salary_month(day), name)
+
+
+class UsualPaydayTests(unittest.TestCase):
+    def test_day_offset(self):
+        for day, offset in ((d(2026, 11, 1), 0), (d(2026, 11, 2), 1), (d(2026, 11, 15), 14),
+                            (d(2026, 11, 16), -15), (d(2026, 10, 16), -16), (d(2026, 10, 25), -7),
+                            (d(2026, 11, 30), -1), (d(2026, 10, 31), -1), (d(2027, 2, 28), -1), (d(2028, 2, 29), -1)):
+            with self.subTest(day=day):
+                self.assertEqual(day_offset(day), offset)
+
+    def test_usual_offset(self):
+        for days, offset in (
+            ((d(2026, 10, 31), d(2026, 11, 1), d(2026, 11, 2)), 0),
+            ((d(2026, 8, 31), d(2026, 9, 30), d(2026, 10, 31)), -1),  # CUJ 3
+            ((d(2026, 6, 25), d(2026, 7, 1), d(2026, 8, 31), d(2026, 9, 30), d(2026, 10, 31)), -1),  # the last 3
+            ((d(2026, 10, 31), d(2026, 11, 2)), -1),  # two days: the lower
+            ((), None),
+            ((d(2026, 10, 31),), None),
+        ):
+            with self.subTest(days=days):
+                self.assertEqual(usual_offset(list(days)), offset)
+
+    def test_payday_in(self):
+        self.assertEqual(payday_in("2026-12", -1), d(2026, 11, 30))
+        self.assertEqual(payday_in("2027-03", -1), d(2027, 2, 28))
+        self.assertEqual(payday_in("2026-12", 0), d(2026, 12, 1))
+        self.assertEqual(payday_in("2027-01", 2), d(2027, 1, 3))
+
+    def test_expected_after(self):
+        self.assertEqual(expected_after([d(2026, 10, 31), d(2026, 11, 1), d(2026, 11, 2)], 0), d(2026, 12, 1))
+        self.assertEqual(expected_after([d(2026, 8, 31), d(2026, 9, 30), d(2026, 10, 31)], -1), d(2026, 11, 30))
+        self.assertEqual(expected_after([d(2026, 11, 30), d(2026, 12, 31)], -1), d(2027, 1, 31))  # year wrap
+        self.assertEqual(expected_after([d(2026, 10, 1), d(2026, 11, 15)], 0), d(2026, 12, 1))
 
 
 class BuildTests(unittest.TestCase):

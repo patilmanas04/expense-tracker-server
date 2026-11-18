@@ -835,3 +835,19 @@ class RecurringDecision(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "merchant_hash", "cadence", name="uq_recurring_decision"),
     )
+
+
+class JobRun(Base):
+    """When each daily job (jobs.py) last claimed its run. Runner state, not a preference, so it isn't in
+    user_settings and needs no owner. One row per job name, created on its first run."""
+
+    __tablename__ = "job_runs"
+
+    name: Mapped[str] = mapped_column(
+        String(64),
+        primary_key=True,
+    )  # as registered, e.g. "watchdog"
+    last_run: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )  # UTC, set in Python by jobs._claim

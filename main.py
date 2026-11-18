@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import os
 import secrets
 import logging
@@ -20,6 +22,7 @@ from database import get_db, init_db
 from models import Transaction, User
 import categorize
 import duplicates
+import jobs
 import limits
 import low_balance
 import payment_alerts
@@ -27,6 +30,7 @@ import post_save
 import recurring
 import rules
 import settings_store
+import watchdog
 from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
                     detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
@@ -42,6 +46,9 @@ post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai
 post_save.register("low_balance", low_balance.check, {"sms", "manual", "restored"})
 post_save.register("recurring", recurring.check_after_save, {"sms", "manual", "edit", "ai_retry", "restored"})
 
+# Daily jobs (jobs.py), run once a day at 21:00 IST in this order. Later designs add their line here.
+jobs.register("watchdog", watchdog.daily)
+
 load_dotenv()
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -53,7 +60,11 @@ async def lifespan(app: FastAPI):
     # Ensure database tables exist upon server startup
     await init_db()
     print("Database tables initialized successfully.")
+    scheduler = asyncio.create_task(jobs.scheduler())  # daily jobs; the first (catch-up) run is 120 s after start
     yield
+    scheduler.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await scheduler
 
 
 app = FastAPI(
@@ -81,6 +92,7 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.include_router(balance_router)
+app.include_router(jobs.router)
 app.include_router(limits_router)
 app.include_router(notifications_router)
 app.include_router(periods_router)

@@ -11,6 +11,8 @@ uv sync
 uv run uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+`JOBS_SECRET` is optional: it only turns on the external trigger for the daily jobs (see Daily jobs and the SMS watchdog); the daily check runs inside the server without it.
+
 Start the Next.js client separately with `npm install` and `npm run dev`. Visit `http://localhost:3000`. Next.js proxies `/api/v1/*` to FastAPI, so authentication and data share the frontend origin.
 
 ## Google sign-in setup
@@ -199,11 +201,12 @@ All need the dashboard session; writes (the preview included) also need the dash
 **Settings → Alerts** in the app. Every setting is one row in `settings_store.KEYS` (its default and its validation), stored as JSON text in `user_settings` (one row per setting, added by `create_all`), so a new setting needs no new column.
 
 ```http
-GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80, "alerts.low_balance": null, "periods.payday": false}   (every key, always in this order)
+GET /api/v1/settings   -> {"alerts.large_amount": null, "alerts.unusual": true, "limits.warn_percent": 80, "alerts.low_balance": null, "periods.payday": false, "watchdog.enabled": true, "watchdog.quiet_days": 4, "watchdog.salary_check": true, "watchdog.email": true}   (every key, always in this order)
 PUT /api/v1/settings   {"alerts.large_amount": 5000}   -> the full object after saving
 PUT /api/v1/settings   {"limits.warn_percent": null}   -> warnings Off
 PUT /api/v1/settings   {"alerts.low_balance": 10000}   -> alert when Balance left drops below ₹10,000
 PUT /api/v1/settings   {"periods.payday": true}        -> months start on payday (see Pay periods)
+PUT /api/v1/settings   {"watchdog.quiet_days": 6}      -> warn after 6 days with no bank SMS (see Daily jobs and the SMS watchdog)
 ```
 
 | Key | Value | Default |
@@ -213,6 +216,10 @@ PUT /api/v1/settings   {"periods.payday": true}        -> months start on payday
 | `limits.warn_percent` | the near-limit warning level: 50 to 95 in steps of 5, or `null` (Off) | `80` |
 | `alerts.low_balance` | the low-balance level: whole rupees, 1 to 10,00,00,000, or `null` (Off); the app shows it under Settings → Bank balance | `null` (Off) |
 | `periods.payday` | "Month starts on payday" (see Pay periods): `true` / `false` | `false` |
+| `watchdog.enabled` | the daily SMS watchdog (see Daily jobs and the SMS watchdog): `true` / `false` | `true` |
+| `watchdog.quiet_days` | days with no bank SMS before a warning: a whole number, 2 to 14 | `4` |
+| `watchdog.salary_check` | warn when salary is more than 3 days past its usual date: `true` / `false` | `true` |
+| `watchdog.email` | also email watchdog warnings (only when Gmail is configured): `true` / `false` | `true` |
 
 Both need the dashboard session (401 "Please sign in…" without it); `PUT` also needs the dashboard `Origin` (403 "Invalid request origin."). `PUT` is partial: it changes only the keys given, and `{}` changes nothing. Validation is strict JSON typing: an amount must be a JSON integer (`5000.0` is taken as `5000`); `true`, `"5000"` and `5000.5` are rejected, and `alerts.unusual` takes only `true` or `false`. Every key is checked before anything is written, so a 422 writes nothing; it names the first bad key in the body's order:
 
@@ -221,7 +228,8 @@ Both need the dashboard session (401 "Please sign in…" without it); `PUT` also
 - `{"detail": "alerts.unusual: Choose on or off."}`,
 - `{"detail": "limits.warn_percent: Choose 50% to 95% in steps of 5, or Off."}` (45, 82, 100, 0, 50.5, `true`, `"80"`; `80.0` is taken as `80`),
 - `{"detail": "alerts.low_balance: Enter a whole number of rupees from 1 to 10,00,00,000, or turn it off."}` (0, 100000001, `true`, `"5000"`, 5000.5; `5000.0` is taken as `5000`),
-- `{"detail": "periods.payday: Choose on or off."}` (`"yes"`, `1`, `null`).
+- `{"detail": "periods.payday: Choose on or off."}` (`"yes"`, `1`, `null`); the same "Choose on or off." for `watchdog.enabled`, `watchdog.salary_check` and `watchdog.email`,
+- `{"detail": "watchdog.quiet_days: Choose 2 to 14 days."}` (1, 15, 0, 4.5, `true`, `"4"`, `null`; `5.0` is taken as `5`).
 
 A body that isn't a JSON object gets FastAPI's own 422 (a list `detail`). A missing row means the default; a stored `null` is a value (for `alerts.large_amount`, Off). A stored value that no longer passes its key's rules is logged and read as the default. Two first saves of the same key at once end with one row (the loser's commit fails and it updates the winner's row). `KEY` is a reserved word in MySQL/TiDB: SQLAlchemy quotes it, and no raw SQL may use this table.
 
@@ -331,6 +339,60 @@ Notifications (in-app, linking to `/report/recurring`), from the `recurring` pos
 - **Price** (`kind = "recurring_price"`, dedupe key `recurring_price:<transaction id>`): "was" is set and the two payments before the newest were within 5% of each other. "Netflix went up: ₹649" / "Was ₹499. Next around 13 Dec." ("went down" for a drop). A bill that varies (electricity) sends none.
 
 Money in these texts drops a trailing ".00" ("₹649", "₹10,688.10"); names over 120 characters are cut with "…".
+
+## Daily jobs and the SMS watchdog
+
+Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it stops (an iOS update, a revoked permission, a changed Shortcut), Folio simply receives nothing. A daily check run by the server itself warns you.
+
+### The daily job runner (`jobs.py`)
+
+- **When:** once a day at **21:00 IST**, inside the server process (an `asyncio` task started at start-up and cancelled at shutdown). **120 seconds after start-up** it also runs a catch-up, so a server that was down or asleep at 21:00 catches up (the delay lets an SMS that woke a sleeping host be saved first).
+- **Due:** a job is due when it hasn't run since the most recent 21:00 IST. The scheduler, the catch-up and the external trigger all use that one rule.
+- **Claim:** before a job runs, its row in `job_runs` (`name` primary key, `last_run`; created by `create_all`, runner state with no owner) is updated only if `last_run` is before that 21:00 (or inserted on the first run; a unique-key clash means another worker won). So several workers, a restart or a cron added later never run a job twice in one slot. A job that fails after its claim is logged and waits for the next day.
+- **Jobs** are registered in one block in `main.py` (`jobs.register("watchdog", watchdog.daily)`) and run in that order, each in its own session, with the owner (`DASHBOARD_OWNER_EMAIL`; none configured or not signed up yet → nothing runs) and today's IST date.
+
+**External trigger.** If your host sleeps when idle, the in-process timer never fires. Set `JOBS_SECRET` in `.env` (a long random string, different from `WEBHOOK_SECRET`) and have a free cron service, or the host's cron, call this daily at **21:05 IST (15:35 UTC)**:
+
+```bash
+curl -fsS -X POST -H "X-Jobs-Secret: $JOBS_SECRET" https://<your-server>/api/v1/jobs/daily
+```
+
+```http
+POST /api/v1/jobs/daily              -> 200 {"ran": ["watchdog"]}   (the jobs that completed in this call; [] when nothing was due)
+POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already ran since 21:00 IST
+```
+
+- `401 {"detail": "Invalid or missing jobs secret."}`: `X-Jobs-Secret` missing or wrong. The webhook secret is always refused here, even if `JOBS_SECRET` was set to the same value.
+- `503 {"detail": "JOBS_SECRET is not configured."}`: no `JOBS_SECRET` (the trigger is off; the in-process scheduler still runs).
+- Other methods get 405. No session, no `Origin` check and no body; `X-Jobs-Secret` is not in the CORS headers (server to server only).
+
+**Never give a cron service the webhook secret**: anyone holding it can post fake bank SMS. A leaked jobs secret can only run the daily check.
+
+### The SMS watchdog (`watchdog.py`)
+
+Settings → Alerts: `watchdog.enabled` (default on; off, nothing below runs), `watchdog.quiet_days` (N, 2–14, default 4), `watchdog.salary_check` (default on), `watchdog.email` (default on). **Received SMS** are stored rows not added by hand (`parsed_by` other than `manual`), readable or not, edited and held-out possible duplicates included, yours or unassigned. Ignored SMS (OTPs, offers, exact repeats) are never stored, so they don't count: a working Shortcut is reported quiet only after N days with no stored bank SMS at all (no payments either). That's accepted rather than writing a heartbeat on every webhook call.
+
+| Check | Fires when | Title | Dedupe key | Link |
+| --- | --- | --- | --- | --- |
+| Quiet pipeline | the newest received SMS is more than N days old (no SMS ever: nothing) | No bank SMS for 4 days — check your iPhone Shortcut | `watchdog:quiet:{IST date of that SMS}` | `/settings#alerts` |
+| Quiet bank (skipped while the pipeline is quiet) | a bank with at least 3 SMS in the last 60 days has none for longer than N days or twice its longest gap between SMS in those 60 days (whichever is longer), while another bank has one within N days | No HDFC SMS for 4 days | `watchdog:quiet:{BANK}:{IST date}` | `/settings#alerts` |
+| Salary late (`watchdog.salary_check`) | at least 2 salary days in the last 120 days, and today is more than 3 days past the expected payday | Salary usually arrives around 30 Nov; not seen yet | `watchdog:salary:{expected date}` | `/settings#alerts` |
+| Unreadable | 5 or more received SMS not parsed in the last 24 hours | 6 SMS couldn't be read today | `watchdog:unreadable:{today}` | `/activity?kind=review` (Needs review) |
+
+`n` in the titles is the whole days since that SMS. `BANK` is `parser.detect_bank`'s name (HDFC, ICICI, SBI, Axis, Kotak), from the sender or the text; rows with no bank are ignored by the bank check. Bodies:
+
+- Quiet pipeline: "The last bank SMS reached Folio on 16 Nov. On your iPhone, open Shortcuts → Automation and check that the bank-SMS automation is still on and runs without asking."
+- Quiet bank: "ICICI SMS still arrive, but the last HDFC SMS reached Folio on 15 Nov. Check that your iPhone automation still forwards HDFC's messages."
+- Salary late: "No credit in the Salary category since 31 Oct. If it has arrived, set its category to Salary in Activity."
+- Unreadable: "They're in Activity under Needs review. If your bank changed its SMS format, more will fail until Folio's parser is updated."
+
+All are `kind = "watchdog"`, no buttons. **Once per episode:** the dedupe key names the episode, so the same silence never warns twice; the next SMS (or salary) clears it, and a later silence has a new key and warns again. Each check runs on its own (one that fails is logged and the others still run). Cost: 5 statements when nothing fires (settings, newest SMS, the banks' SMS of 60 days, salary days, unreadable count; 4 while the pipeline is quiet or with the salary check off), 1 when off, +2 per new warning.
+
+**Usual payday** (`pay_periods.py`, the one rule for "when salary usually arrives"): each salary day (see Pay periods) becomes its distance from the nearest 1st, `day_offset` (1st–15th → day − 1, so 2 Nov → 1; 16th or later → minus the days to the next 1st, so 31 Oct, 30 Nov and 28 Feb → −1, 25 Oct → −7). `usual_offset` is the lower median of the last 3 (at least 2 needed); `expected_after` is that offset from the 1st of the month after the newest salary's name (`payday_in`). Example (CUJ 3): salary on 31 Aug, 30 Sep and 31 Oct → offset −1 → expected 30 Nov; on 4 Dec, with nothing since 31 Oct, it's late (more than 3 days past) and warns "Salary usually arrives around 30 Nov; not seen yet". A plain median of the day of the month would have said "the 30th/31st" of the wrong month. Salary detection depends on the Salary category being set correctly, and a mid-month bonus in Salary counts as the newest salary (it moves the expected date to the following month).
+
+**Email:** a warning is also emailed only when it was newly created, `watchdog.email` is on and Gmail is configured (see Spend limits, notifications and email alerts): to `ALERT_EMAIL_TO` (or the owner), subject = the title, text = the body plus "Open Folio: Settings → Alerts.". If Gmail refuses it, the error is logged and one bell notification per day says "Email alerts aren't being sent" ("Gmail refused the last email. Run scripts/gmail_authorize.py again (see the server README).", key `watchdog:email-failed:{today}`). While the OAuth app is in *Testing*, Google expires the refresh token every 7 days, so email would stop silently; publish the app (see [Optional: get the Gmail OAuth credentials](#optional-get-the-gmail-oauth-credentials-one-time), step 3).
+
+Tests: `tests/test_jobs.py` (the slot, the claim, races, failures, the scheduler, the lifespan task and the trigger), `tests/test_watchdog.py` (each check at its threshold, once per episode, settings, statement counts, email mocked, the trigger end to end) and `tests/test_pay_periods.py` (`UsualPaydayTests`).
 
 ## Spend limits, notifications and (optional) email alerts
 

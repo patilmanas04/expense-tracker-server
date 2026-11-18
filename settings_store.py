@@ -104,6 +104,14 @@ KEYS: dict[str, Key] = {
     )),
     # Months start on the day your salary (category Salary) arrives (pay_periods.py). Off = calendar months.
     "periods.payday": Key(False, boolean(message="Choose on or off.")),
+    # SMS watchdog (watchdog.py): a daily check that bank SMS still arrive, salary isn't late and SMS can be read.
+    "watchdog.enabled": Key(True, boolean(message="Choose on or off.")),
+    # Days with no bank SMS before the watchdog warns, 2–14.
+    "watchdog.quiet_days": Key(4, whole_number(2, 14, nullable=False, message="Choose 2 to 14 days.")),
+    # Warn when salary (category Salary) is more than 3 days past its usual date.
+    "watchdog.salary_check": Key(True, boolean(message="Choose on or off.")),
+    # Also email watchdog warnings (only when Gmail is configured).
+    "watchdog.email": Key(True, boolean(message="Choose on or off.")),
 }
 
 

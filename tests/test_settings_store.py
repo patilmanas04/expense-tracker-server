@@ -27,7 +27,8 @@ from models import User, UserSetting
 
 ORIGIN = {"Origin": "http://localhost:3000"}
 DEFAULTS = {"alerts.large_amount": None, "alerts.unusual": True, "limits.warn_percent": 80,
-            "alerts.low_balance": None, "periods.payday": False}
+            "alerts.low_balance": None, "periods.payday": False, "watchdog.enabled": True,
+            "watchdog.quiet_days": 4, "watchdog.salary_check": True, "watchdog.email": True}
 AMOUNT_ERROR = "alerts.large_amount: Enter a whole number of rupees from 1 to 1,00,00,000, or turn it off."
 UNUSUAL_ERROR = "alerts.unusual: Choose on or off."
 
@@ -108,7 +109,8 @@ class DefaultsTests(SettingsTestCase):
         await self.put({"alerts.large_amount": 5000})
         data = await self.put({"alerts.unusual": False})
         self.assertEqual(data, {"alerts.large_amount": 5000, "alerts.unusual": False, "limits.warn_percent": 80,
-                                "alerts.low_balance": None, "periods.payday": False})
+                                "alerts.low_balance": None, "periods.payday": False, "watchdog.enabled": True,
+                                "watchdog.quiet_days": 4, "watchdog.salary_check": True, "watchdog.email": True})
         self.assertEqual(list(data), list(settings_store.KEYS))
         self.assertEqual(await self.get(), data)
 
@@ -150,11 +152,43 @@ class ValidationTests(SettingsTestCase):
                 await self.rejected({"periods.payday": value}, "periods.payday: Choose on or off.")
         data = await self.put({"periods.payday": True})
         self.assertIs(data["periods.payday"], True)
-        self.assertEqual(list(data)[-1], "periods.payday")
+        self.assertEqual(list(data)[4], "periods.payday")  # after alerts.low_balance, before watchdog.*
         [row] = await self.rows()
         self.assertEqual((row.key, row.value), ("periods.payday", "true"))
         self.assertIs((await self.get())["periods.payday"], True)
         self.assertIs((await self.put({"periods.payday": False}))["periods.payday"], False)
+
+    async def test_watchdog_keys(self):
+        data = await self.get()
+        self.assertEqual([(key, data[key]) for key in list(data)[5:]],
+                         [("watchdog.enabled", True), ("watchdog.quiet_days", 4), ("watchdog.salary_check", True),
+                          ("watchdog.email", True)])
+        for value in (1, 15, 0, 4.5, True, "4", None, -4, [4]):
+            with self.subTest(value=value):
+                await self.rejected({"watchdog.quiet_days": value}, "watchdog.quiet_days: Choose 2 to 14 days.")
+        for key in ("watchdog.enabled", "watchdog.salary_check", "watchdog.email"):
+            for value in (1, "yes", None):
+                with self.subTest(key=key, value=value):
+                    await self.rejected({key: value}, f"{key}: Choose on or off.")
+        for value, expected in ((2, 2), (14, 14), (5.0, 5)):
+            with self.subTest(value=value):
+                data = await self.put({"watchdog.quiet_days": value})
+                self.assertEqual(data["watchdog.quiet_days"], expected)
+                self.assertIs(type(data["watchdog.quiet_days"]), int)
+        data = await self.put({"watchdog.enabled": False, "watchdog.salary_check": False, "watchdog.email": False})
+        self.assertEqual([data[key] for key in ("watchdog.enabled", "watchdog.salary_check", "watchdog.email")],
+                         [False, False, False])
+        self.assertEqual(sorted((r.key, r.value) for r in await self.rows()),
+                         [("watchdog.email", "false"), ("watchdog.enabled", "false"), ("watchdog.quiet_days", "5"),
+                          ("watchdog.salary_check", "false")])
+        await self.rejected_keeps({"watchdog.quiet_days": 6, "watchdog.email": "yes"}, "watchdog.email: Choose on or off.")
+        self.assertEqual((await self.get())["watchdog.quiet_days"], 5)
+
+    async def rejected_keeps(self, body, detail):
+        """A 422 that leaves the stored rows as they were."""
+        before = sorted((r.key, r.value) for r in await self.rows())
+        self.assertEqual(await self.put(body, status=422), {"detail": detail})
+        self.assertEqual(sorted((r.key, r.value) for r in await self.rows()), before)
 
     async def test_nothing_is_written_when_a_later_key_is_bad(self):
         await self.rejected({"alerts.large_amount": 5000, "alerts.unusual": "yes"}, UNUSUAL_ERROR)
@@ -236,7 +270,8 @@ class StoredValueTests(SettingsTestCase):
         async with AsyncSessionLocal() as db:
             self.assertEqual(await settings_store.load(db, self.other.id),
                              {"alerts.large_amount": 100, "alerts.unusual": False, "limits.warn_percent": 80,
-                              "alerts.low_balance": None, "periods.payday": False})
+                              "alerts.low_balance": None, "periods.payday": False, "watchdog.enabled": True,
+                              "watchdog.quiet_days": 4, "watchdog.salary_check": True, "watchdog.email": True})
 
 
 class RaceAndTableTests(SettingsTestCase):

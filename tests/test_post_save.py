@@ -170,7 +170,8 @@ class RunnerTests(PostSaveTestCase):
         post_save.register("c", recorder("c"), {"edit"})
         await post_save.run(txn_id, "edit")
         settings = {"alerts.large_amount": None, "alerts.unusual": False, "limits.warn_percent": 80,
-                    "alerts.low_balance": None, "periods.payday": False}
+                    "alerts.low_balance": None, "periods.payday": False, "watchdog.enabled": True,
+                    "watchdog.quiet_days": 4, "watchdog.salary_check": True, "watchdog.email": True}
         self.assertEqual(seen, [("a", "edit", txn_id, "owner@example.com", settings),
                                 ("c", "edit", txn_id, "owner@example.com", settings)])
         seen.clear()

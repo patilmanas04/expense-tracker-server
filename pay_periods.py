@@ -18,9 +18,15 @@ and the monthly limit window only, never to decide which period a payment belong
 
 This module is the one server copy of these rules (expense-tracker-client/lib/periods.ts is the app's). It has no
 clock: `build` is pure and `monthly_window` takes the moment. `salary_days` doesn't look at the setting, so other
-features can use it. Doc 13 later adds usual_offset, payday_in and expected_after here. limits.py imports this
-module, so this module never imports limits.
+features can use it. limits.py imports this module, so this module never imports limits.
+
+The usual payday (the SMS watchdog, doc 13; later doc 17) is one rule, also here: each salary day becomes its
+distance from the nearest 1st of a month (`day_offset`: 31 Oct → −1, 2 Nov → 1), the usual payday is the lower
+median of the last 3 (`usual_offset`, at least 2 needed), and the next expected salary is that offset from the
+1st of the month after the newest salary's name (`expected_after`). These are pure: no clock, no settings, no
+deduping of the days given.
 """
+import statistics
 from bisect import bisect_right
 from calendar import monthrange
 from dataclasses import dataclass
@@ -83,6 +89,35 @@ def salary_month(day: date) -> str:
     """The month a salary on `day` pays for: its own on the 1st–15th, the next one on the 16th or later."""
     month = f"{day:%Y-%m}"
     return month if day.day < SALARY_NEXT_MONTH_FROM else _shift(month, 1)
+
+
+def day_offset(day: date) -> int:
+    """Days from the nearest 1st of a month: the 1st–15th → day − 1 (1st → 0); the 16th or later → minus the days
+    left to the next 1st (31 Oct → −1, 30 Nov → −1, 28 Feb → −1, 25 Oct → −7). The 16th boundary is
+    SALARY_NEXT_MONTH_FROM, so the sign agrees with salary_month."""
+    if day.day < SALARY_NEXT_MONTH_FROM:
+        return day.day - 1
+    return day.day - monthrange(day.year, day.month)[1] - 1
+
+
+def usual_offset(days: Sequence[date]) -> Optional[int]:
+    """The usual payday as a day_offset: the lower median of the last 3 salary days (ascending, as salary_days
+    gives them); None with fewer than 2."""
+    recent = list(days)[-3:]
+    if len(recent) < 2:
+        return None
+    return statistics.median_low([day_offset(day) for day in recent])
+
+
+def payday_in(month: str, offset: int) -> date:
+    """The payday for `month` ("YYYY-MM"): its 1st plus `offset` days (−1 is the last day of the month before)."""
+    return _first_of(month) + timedelta(days=offset)
+
+
+def expected_after(days: Sequence[date], offset: int) -> date:
+    """The payday after the newest salary: payday_in(the month after salary_month(newest), offset).
+    Newest 31 Oct (salary month November), offset −1 → 30 Nov."""
+    return payday_in(_shift(salary_month(max(days)), 1), offset)
 
 
 async def salary_days(db: AsyncSession, user: User) -> list[date]:

@@ -276,9 +276,13 @@ class WarnSettingTests(WarningTestCase):
         response = await self.client.get("/api/v1/settings")
         self.assertEqual(response.json(), {"alerts.large_amount": None, "alerts.unusual": True,
                                            "limits.warn_percent": 80, "alerts.low_balance": None,
-                                           "periods.payday": False})
+                                           "periods.payday": False, "watchdog.enabled": True,
+                                           "watchdog.quiet_days": 4, "watchdog.salary_check": True,
+                                           "watchdog.email": True})
         self.assertEqual(list(response.json()), ["alerts.large_amount", "alerts.unusual", "limits.warn_percent",
-                                                 "alerts.low_balance", "periods.payday"])
+                                                 "alerts.low_balance", "periods.payday", "watchdog.enabled",
+                                                 "watchdog.quiet_days", "watchdog.salary_check",
+                                                 "watchdog.email"])
 
     async def test_invalid_levels_write_nothing(self):
         for value in (45, 82, 100, 0, 50.5, True, "80", 96, 49, -80, [80]):
