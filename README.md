@@ -286,6 +286,7 @@ One background task, `post_save.run(transaction_id, cause)`, runs every check th
 | `payment_alerts` (large or unusual payment) | `sms`, `manual`, `ai_retry`, `restored` (not `edit`: an edit is your own change) |
 | `low_balance` (Balance left dropped below your level) | `sms`, `manual`, `restored` (only "Not a duplicate"; a row released by deleting its original doesn't alert) |
 | `recurring` (a new recurring payment, or its price changed) | all five (only the newest payment of a series notifies, so an edit to an older one or a late SMS doesn't) |
+| `refunds` (is this credit the refund you're expecting? See Refund watch) | `sms`, `manual`, `restored` (a held-out credit is suggested once you mark it "Not a duplicate") |
 
 A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
 
@@ -383,6 +384,52 @@ The rules are written and tested against HDFC and ICICI wording only; other bank
 
 Tests: `tests/test_upcoming.py` (the paid and not-seen rules at their edges, the list, merge, `leaves_bank`, order and statement counts, the API and dismiss, the reminder).
 
+## Refund watch
+
+`refunds.py` keeps track of money you're owed back: a return, a cancelled order, a failed booking. You mark a payment "Expect a refund"; when a matching credit arrives Folio asks "Is this your Myntra refund?" with Yes / No; if nothing has come by the date you picked, it reminds you once.
+
+Watches live in `refund_watches` (added by `create_all`; no column is added to an existing table):
+
+| Column | |
+| --- | --- |
+| `id` | UUID |
+| `user_id` | the owner (FK `users`, cascade) |
+| `transaction_id` | the payment (FK `transactions`, cascade; unique, `uq_refund_watch_transaction`: one watch per payment) |
+| `expected_amount` | `Numeric(12, 2)`, more than zero and at most the payment |
+| `due_date` | "expected by", an IST date |
+| `credit_id` | the credit you confirmed (FK `transactions`, set null; unique, `uq_refund_watch_credit`: one credit settles one payment) |
+| `created_at`, `closed_at` | `closed_at` is set when you confirm a credit |
+
+A watch is **open** (`expected`) while `credit_id` is null and **refunded** once it's set; "No refund expected" deletes the row. Every transaction response carries `refund` (`"expected"`, `"refunded"` or `null`: this row is a watched payment) and `refund_for` (on the confirmed credit, the payment's id, else `null`). Every write that changes either moves `updated_at` on each row it changes, in the same commit, so the app's poll picks them up.
+
+```http
+POST   /api/v1/refunds                                       {"transaction_id": "<uuid>", "amount": "2499", "due_date": "2026-11-29"}  -> 201 RefundWatchOut
+GET    /api/v1/refunds/{transaction_id}                      -> 200 RefundWatchOut
+DELETE /api/v1/refunds/{transaction_id}                      -> 204   ("No refund expected")
+POST   /api/v1/refunds/{transaction_id}/accept/{credit_id}   -> 200 RefundWatchOut (state "refunded")   (Yes)
+POST   /api/v1/refunds/{transaction_id}/reject/{credit_id}   -> 204   (No)
+```
+
+`RefundWatchOut` = `{"transaction_id": "<uuid>", "expected_amount": "2499.00", "due_date": "2026-11-29", "credit_id": "<uuid>" | null, "state": "expected" | "refunded"}`. Every route needs the owner session (401); the writes also need the app's `Origin` (403 "Invalid request origin."). A malformed UUID, date or amount (more than 2 decimal places or 12 digits) is FastAPI's 422 with a list `detail`. Errors, checked in this order:
+
+- **Mark:** 404 "Transaction not found." (unknown, or another user's; unassigned SMS rows are yours) · 422 "Only payments can expect a refund." (a credit, or an SMS that couldn't be read) · 422 "Enter a refund amount more than zero." · 422 "The refund can't be more than the payment (₹2,499)." · 422 "Pick a date 1 to 60 days from today." (IST; the app suggests 10 days) · 409 "A refund is already expected for this payment." (open or refunded; also when two taps race). Cancel first to change one.
+- **Get / cancel:** 404 "No refund is expected for this payment." Cancelling a refunded watch makes its credit a plain credit again.
+- **Accept:** 404 "No refund is expected for this payment." · 404 "Credit not found." (not your parsed credit) · 409 "This refund is already confirmed." (even for the same credit) · 409 "That credit is already matched to another refund." It sets `credit_id` and `closed_at`.
+- **Reject:** always 204. It deletes that suggestion (its `refund:{payment}:{credit}` notification, and its swipe-away row); the watch stays open.
+
+**Suggestion** (post-save check `refunds`, for `sms`, `manual` and `restored`): a saved credit is offered for **one** open watch. The credit must be parsed, more than zero, not Credit Card Payment or Self Transfer (a card payment or your own transfer is never a refund), and not already a watch's refund. A watch is a candidate when its payment has the same currency and was made from 90 days before the credit up to the credit (inclusive), and the credit is **exactly** the expected amount (from anyone: a refund via UPI may come from a payment company's name), or **less** and shares a meaningful word with the payment's merchant (`merchants.share_word` on the credit's merchant and SMS text, so a credit whose merchant wasn't read still matches on its text; bank names and other common words don't count). The best wins: exact amount first, then the nearest payment, then the older watch. A larger credit is never suggested. One notification per payment and credit, ever:
+
+- `kind = "refund_match"`, "Is this your Myntra refund?" ("Is this a refund?" when the payment has no merchant) / "₹2,499 from Myntra Designs BANGALORE on 21 Oct" ("₹2,499 on 21 Oct" when the credit has none; the credit's IST date), link `null`, dedupe key `refund:{payment id}:{credit id}`.
+- Buttons (`notifications.register_actions`, the first real resolver): Yes → `POST /api/v1/refunds/{payment}/accept/{credit}`, No → `POST /api/v1/refunds/{payment}/reject/{credit}` while the watch is open and the credit still exists; once decided, "Marked as refunded" (this credit closed it) or "No longer applies" (another credit closed it, the watch was cancelled, or the credit was deleted). At most 2 statements per inbox read.
+
+**Reminder** (daily job `refund_overdue`, see Daily jobs): one bell notification per open watch whose date has passed.
+
+**Deleting a transaction** (`DELETE /api/v1/transactions/{id}`, same commit): a watched payment's watch is deleted (its confirmed credit's `refund_for` clears and the credit is bumped); deleting a confirmed credit makes its watch open again (`credit_id` and `closed_at` cleared, the payment bumped), so a later credit can be suggested.
+
+**Limits:** edits don't touch watches (editing a watched payment's amount or type, or a confirmed credit, leaves the watch as it is; cancel it to start over). A rejected suggestion can come back only if the same credit is saved again (deleted and re-sent). Cost: the check is free for anything but a counted credit, then 1 statement, or 2 when an open watch is in the window, plus one commit when it notifies.
+
+Tests: `tests/test_refunds.py` (marking and every error, suggestions and their edges, Yes / No, the buttons and their resolved texts, the reminder job, cleanup on delete, statement counts).
+
 ## Daily jobs and the SMS watchdog
 
 Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it stops (an iOS update, a revoked permission, a changed Shortcut), Folio simply receives nothing. A daily check run by the server itself warns you.
@@ -392,7 +439,7 @@ Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it 
 - **When:** once a day at **21:00 IST**, inside the server process (an `asyncio` task started at start-up and cancelled at shutdown). **120 seconds after start-up** it also runs a catch-up, so a server that was down or asleep at 21:00 catches up (the delay lets an SMS that woke a sleeping host be saved first).
 - **Due:** a job is due when it hasn't run since the most recent 21:00 IST. The scheduler, the catch-up and the external trigger all use that one rule.
 - **Claim:** before a job runs, its row in `job_runs` (`name` primary key, `last_run`; created by `create_all`, runner state with no owner) is updated only if `last_run` is before that 21:00 (or inserted on the first run; a unique-key clash means another worker won). So several workers, a restart or a cron added later never run a job twice in one slot. A job that fails after its claim is logged and waits for the next day.
-- **Jobs** are registered in one block in `main.py` (`jobs.register("watchdog", watchdog.daily)`, then `jobs.register("upcoming_reminders", upcoming.daily)`) and run in that order, each in its own session, with the owner (`DASHBOARD_OWNER_EMAIL`; none configured or not signed up yet → nothing runs) and today's IST date.
+- **Jobs** are registered in one block in `main.py` (`jobs.register("watchdog", watchdog.daily)`, then `jobs.register("upcoming_reminders", upcoming.daily)`, then `jobs.register("refund_overdue", refunds.daily)`) and run in that order, each in its own session, with the owner (`DASHBOARD_OWNER_EMAIL`; none configured or not signed up yet → nothing runs) and today's IST date.
 
 **External trigger.** If your host sleeps when idle, the in-process timer never fires. Set `JOBS_SECRET` in `.env` (a long random string, different from `WEBHOOK_SECRET`) and have a free cron service, or the host's cron, call this daily at **21:05 IST (15:35 UTC)**:
 
@@ -401,7 +448,7 @@ curl -fsS -X POST -H "X-Jobs-Secret: $JOBS_SECRET" https://<your-server>/api/v1/
 ```
 
 ```http
-POST /api/v1/jobs/daily              -> 200 {"ran": ["watchdog", "upcoming_reminders"]}   (the jobs that completed in this call; [] when nothing was due)
+POST /api/v1/jobs/daily              -> 200 {"ran": ["watchdog", "upcoming_reminders", "refund_overdue"]}   (the jobs that completed in this call; [] when nothing was due)
 POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already ran since 21:00 IST
 ```
 
@@ -414,6 +461,10 @@ POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already r
 ### Card-bill reminder (`upcoming_reminders`)
 
 `upcoming.daily` reads the upcoming list for today and tomorrow and, for each card bill still `upcoming` (not paid, not dismissed) due today or tomorrow, adds one bell notification: `kind = "card_bill_due"`, "HDFC card XX9012 bill due tomorrow" ("… due today" on the due date) / "₹4,500 due on 5 Dec (minimum ₹500). No payment seen yet." (no "(minimum …)" when the bill gives none), link `/upcoming`, dedupe key `card_bill_due:<notice id>`. The 21:00 run normally sends it the evening before; if that run is missed, the catch-up or the due-date run sends it. **Once per bill**, and never emailed. A failure is logged and rolled back, and the job still counts as run. Until notices are stored (see Upcoming payments) it finds no card bills and creates nothing.
+
+### Refund reminder (`refund_overdue`)
+
+`refunds.daily` finds your open refund watches (see Refund watch) whose "expected by" date is before today (IST) and adds one bell notification each: `kind = "refund_overdue"`, "Refund from Myntra still pending" ("Refund still pending" when the payment has no merchant) / "₹2,499 expected by 13 Nov." (₹1,000.50 for a partial amount), link `/activity?txn={payment id}` (Activity opens that payment), dedupe key `refund-overdue:{watch id}`. **Once per watch**, never emailed; a refunded or cancelled watch gets none. A failure is logged and rolled back, and the job still counts as run. Cost: 1 statement, plus one commit per new reminder.
 
 ### The SMS watchdog (`watchdog.py`)
 
@@ -439,7 +490,7 @@ All are `kind = "watchdog"`, no buttons. **Once per episode:** the dedupe key na
 
 **Email:** a warning is also emailed only when it was newly created, `watchdog.email` is on and Gmail is configured (see Spend limits, notifications and email alerts): to `ALERT_EMAIL_TO` (or the owner), subject = the title, text = the body plus "Open Folio: Settings → Alerts.". If Gmail refuses it, the error is logged and one bell notification per day says "Email alerts aren't being sent" ("Gmail refused the last email. Run scripts/gmail_authorize.py again (see the server README).", key `watchdog:email-failed:{today}`). While the OAuth app is in *Testing*, Google expires the refresh token every 7 days, so email would stop silently; publish the app (see [Optional: get the Gmail OAuth credentials](#optional-get-the-gmail-oauth-credentials-one-time), step 3).
 
-Tests: `tests/test_jobs.py` (the slot, the claim, races, failures, the scheduler, the lifespan task and the trigger), `tests/test_watchdog.py` (each check at its threshold, once per episode, settings, statement counts, email mocked, the trigger end to end), `tests/test_upcoming.py` (`ReminderTests`: the card-bill reminder) and `tests/test_pay_periods.py` (`UsualPaydayTests`).
+Tests: `tests/test_jobs.py` (the slot, the claim, races, failures, the scheduler, the lifespan task and the trigger), `tests/test_watchdog.py` (each check at its threshold, once per episode, settings, statement counts, email mocked, the trigger end to end), `tests/test_upcoming.py` (`ReminderTests`: the card-bill reminder), `tests/test_refunds.py` (`OverdueTests`) and `tests/test_pay_periods.py` (`UsualPaydayTests`).
 
 ## Spend limits, notifications and (optional) email alerts
 
@@ -447,7 +498,7 @@ Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending li
 
 **Warning before a limit is reached:** once spending on a limit is at or above the warning level (`limits.warn_percent` in Settings; 80% by default, Off with `null`) and still under the limit (level ≤ spent < limit, compared exactly, so ₹4,000.00 of ₹5,000 warns at 80%), Folio creates one in-app notification, `kind = "spend_warning"`: "80% of your monthly Food & Dining limit used", "80% of your weekly spend limit used" (overall) or "80% of your monthly Swiggy limit used" (a merchant name over 120 characters is cut with "…"). The body is the same as the reached alert's ("₹4,150.00 of ₹5,000.00 on Food & Dining this month (Thu 1 Oct – Sat 31 Oct) · 83%"; " at Swiggy" for a merchant, nothing for overall) and it links to `/settings/limits`. It goes out once per limit, period, limit amount and level, by its dedupe key: `spend_warn:{period}:{start}:{limit}:{level}` overall, `spend_warn:{category}:{period}:{start}:{limit}:{level}` for a category, `spend_warn:merchant:{limit_id}:{period}:{start}:{limit}:{level}` for a merchant (for example `spend_warn:Food & Dining:monthly:2026-10-01:5000.00:80`); so changing the limit or the level allows one more. Warnings are never emailed. A payment that jumps straight past the limit gives only the reached alert ("… limit crossed"), no warning. The rule depends only on the current total, so every check gives the same answer: an edit that brings spending down from over the limit back into the band warns once; a late SMS for a past week or month never warns (only the payment's own current period is checked, as for reached alerts); and `check_spend_limits` (merges and rule applies) warns too. The same guards apply as for reached alerts: the overall limit only for payments in its currency, a category limit only for the payment's own category, merchant limits only where the name matches. `GET /api/v1/limits` is unchanged: a meter's `alerted` means the reached alert only.
 
-**Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
+**Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts; Refund watch's `refund_match` suggestions are the first kind with buttons. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
 
 **Clearing notifications:** `DELETE /api/v1/notifications/{id}` (swipe to delete) and `DELETE /api/v1/notifications` (Clear) hide notifications instead of deleting them (`notification_dismissals`, added by `create_all`). Each notification is also the record that its alert went out, so a cleared limit alert isn't sent again on the next payment, and the meter in Settings still says "notified".
 

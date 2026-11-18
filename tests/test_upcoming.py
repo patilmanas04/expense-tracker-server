@@ -431,7 +431,7 @@ class ReminderTests(UpcomingTestCase):
             self.assertEqual(await self.reminders(), [])
             response = await self.client.post("/api/v1/jobs/daily", params={"force": "true"}, headers=headers)
         self.assertEqual((response.status_code, response.json()),
-                         (200, {"ran": ["watchdog", "upcoming_reminders"]}))
+                         (200, {"ran": ["watchdog", "upcoming_reminders", "refund_overdue"]}))
         self.assertEqual([title for title, *_ in await self.reminders()], ["HDFC card XX9012 bill due tomorrow"])
 
 

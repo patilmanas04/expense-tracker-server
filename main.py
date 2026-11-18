@@ -28,6 +28,7 @@ import low_balance
 import payment_alerts
 import post_save
 import recurring
+import refunds
 import rules
 import safe_to_spend
 import settings_store
@@ -47,10 +48,12 @@ post_save.register("limits", limits.post_save_check, {"sms", "manual", "edit", "
 post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai_retry", "restored"})
 post_save.register("low_balance", low_balance.check, {"sms", "manual", "restored"})
 post_save.register("recurring", recurring.check_after_save, {"sms", "manual", "edit", "ai_retry", "restored"})
+post_save.register("refunds", refunds.suggest, {"sms", "manual", "restored"})
 
 # Daily jobs (jobs.py), run once a day at 21:00 IST in this order. Later designs add their line here.
 jobs.register("watchdog", watchdog.daily)
 jobs.register("upcoming_reminders", upcoming.daily)
+jobs.register("refund_overdue", refunds.daily)
 
 load_dotenv()
 
@@ -105,6 +108,7 @@ app.include_router(settings_store.router)
 app.include_router(recurring.router)
 app.include_router(upcoming.router)
 app.include_router(safe_to_spend.router)
+app.include_router(refunds.router)
 
 
 @app.middleware("http")
@@ -170,6 +174,8 @@ class TransactionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime  # moves on every edit; the dashboard polls by it
     duplicate_of: Optional[uuid.UUID] = None  # the earlier transaction while this one is held out as a possible duplicate
+    refund: Optional[Literal["expected", "refunded"]] = None  # a payment you expect money back for, and whether it came
+    refund_for: Optional[uuid.UUID] = None  # on a credit you confirmed as a refund: the payment it refunded
 
     @computed_field
     @property
@@ -590,11 +596,13 @@ async def delete_transaction(
     db: AsyncSession = Depends(get_db),
 ):
     """Deletes an SMS or a hand-added entry for good. If the Shortcut sends the same SMS again,
-    it's recorded again. Deleting the earlier of two possible duplicates makes the other count again."""
+    it's recorded again. Deleting the earlier of two possible duplicates makes the other count again; a
+    payment's refund watch goes with it, and deleting a confirmed refund makes its payment's watch open again."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
     released = await duplicates.release(db, txn.id)  # same commit as the delete
+    await refunds.release(db, txn.id)  # same commit as the delete
     await db.delete(txn)
     await db.commit()
     for released_id in released:  # they count again: the after-save checks run

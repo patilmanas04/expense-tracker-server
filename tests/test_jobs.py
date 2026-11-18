@@ -305,11 +305,13 @@ class TriggerTests(JobsTestCase):
 
 class RegistryTests(unittest.TestCase):
     def test_the_real_registry(self):
+        import refunds
         import upcoming
         import watchdog
 
         self.assertIs(main.jobs, jobs)
-        self.assertEqual(jobs._JOBS, [("watchdog", watchdog.daily), ("upcoming_reminders", upcoming.daily)])
+        self.assertEqual(jobs._JOBS, [("watchdog", watchdog.daily), ("upcoming_reminders", upcoming.daily),
+                                      ("refund_overdue", refunds.daily)])
         self.assertEqual(list(main.app.openapi()["paths"]["/api/v1/jobs/daily"]), ["post"])
 
 

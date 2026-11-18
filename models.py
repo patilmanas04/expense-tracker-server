@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
     select,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -911,3 +912,71 @@ class UpcomingPayment(Base):
     __table_args__ = (
         UniqueConstraint("notice_key", name="uq_upcoming_notice"),
     )
+
+
+class RefundWatch(Base):
+    """A payment you expect money back for (refunds.py). Open while credit_id is null, refunded once you confirm
+    a credit. "No refund expected" deletes the row. Rows are cleaned up explicitly when either transaction is
+    deleted (main.delete_transaction); the foreign keys are only a backup."""
+
+    __tablename__ = "refund_watches"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    transaction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=False,
+    )  # the payment (a parsed debit)
+    expected_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+    )  # more than zero, at most the payment
+    due_date: Mapped[date] = mapped_column(
+        Date,
+        nullable=False,
+    )  # IST calendar date: "expected by"
+    credit_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+    )  # the credit you confirmed as the refund
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  # set when you confirm the refund
+
+    __table_args__ = (
+        UniqueConstraint("transaction_id", name="uq_refund_watch_transaction"),
+        UniqueConstraint("credit_id", name="uq_refund_watch_credit"),  # one credit closes one watch; NULLs repeat
+    )
+
+
+# "expected" / "refunded" when this row is a watched payment, else None; and, on a credit you confirmed as a
+# refund, the payment it refunded. One sub-select each per row, on a unique key, like duplicate_of.
+Transaction.refund = column_property(
+    select(case((RefundWatch.credit_id.is_(None), "expected"), else_="refunded"))
+    .where(RefundWatch.transaction_id == Transaction.id)
+    .correlate_except(RefundWatch)
+    .scalar_subquery()
+)
+Transaction.refund_for = column_property(
+    select(RefundWatch.transaction_id)
+    .where(RefundWatch.credit_id == Transaction.id)
+    .correlate_except(RefundWatch)
+    .scalar_subquery()
+)

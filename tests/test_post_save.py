@@ -23,6 +23,7 @@ import limits
 import main
 import post_save
 import recurring
+import refunds
 import settings_store
 from auth import current_user
 from database import AsyncSessionLocal, Base, engine
@@ -142,9 +143,11 @@ class RegisterTests(unittest.TestCase):
             ("payment_alerts", ALL_CAUSES - {"edit"}),
             ("low_balance", {"sms", "manual", "restored"}),
             ("recurring", ALL_CAUSES),
+            ("refunds", {"sms", "manual", "restored"}),
         ])
         self.assertIs(post_save._CHECKS[0][1], limits.post_save_check)
         self.assertIs(post_save._CHECKS[3][1], recurring.check_after_save)
+        self.assertIs(post_save._CHECKS[4][1], refunds.suggest)
         self.assertEqual(post_save.CAUSES, ("sms", "manual", "edit", "ai_retry", "restored"))
 
 
