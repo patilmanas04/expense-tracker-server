@@ -147,8 +147,10 @@ class MerchantLimitTests(GoogleTestCase):
         self.assertEqual(swiggy["merchant"], "Swiggy")
         uuid.UUID(swiggy["id"])
         self.assertEqual(swiggy["counts"], ["Swiggy", "Swiggy Ltd"])
-        self.assertEqual(swiggy["weekly"], {"limit": 1000, "spent": 160, "start": "2026-10-19", "end": "2026-10-25", "alerted": False})
-        self.assertEqual(swiggy["monthly"], {"limit": 5000, "spent": 360, "start": "2026-10-01", "end": "2026-10-31", "alerted": False})
+        self.assertEqual(swiggy["weekly"], {"limit": 1000, "spent": 160, "start": "2026-10-19", "end": "2026-10-25", "alerted": False,
+                                               "base": None, "carried": None})
+        self.assertEqual(swiggy["monthly"], {"limit": 5000, "spent": 360, "start": "2026-10-01", "end": "2026-10-31", "alerted": False,
+                                               "base": None, "carried": None})
         # The overall and category meters are unchanged by merchant limits.
         self.assertEqual((data["weekly"]["limit"], data["weekly"]["spent"], data["categories"]), (None, 100 + 60 + 400 + 450, []))
         # A limit on a merchant with no payments yet counts nothing.

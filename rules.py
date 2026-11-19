@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from collections.abc import Sequence
 from typing import Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, status
@@ -37,6 +38,7 @@ from sqlalchemy import Numeric, String, cast, delete, literal, null, select, uni
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import categories
 import merchants
 from auth import current_user, same_origin
 from categorize import merchant_key
@@ -44,7 +46,7 @@ from dashboard import ownership
 from database import get_db
 from limits import _encodable, _utc, check_spend_limits
 from models import CategoryRule, MerchantAlias, MerchantCategory, Transaction, User
-from parser import CATEGORIES, UNCATEGORIZED
+from parser import UNCATEGORIZED
 
 HAND_SET = ("manual", "edited")  # parsed_by of rows whose category you chose: main.MANUAL and main.EDITED
 MAX_WORDS = 255  # String(255)
@@ -63,11 +65,12 @@ def utc_now() -> datetime:
 
 # ---------- Matching (pure) ----------
 
-def valid_category(name: Optional[str]) -> Optional[str]:
-    """The category's canonical spelling from parser.CATEGORIES, matched without case; None for an unknown
-    name or Uncategorized (a rule must set a category)."""
-    wanted = (name or "").strip().casefold()
-    return next((c for c in CATEGORIES if c != UNCATEGORIZED and c.casefold() == wanted), None)
+def valid_category(name: Optional[str], custom: Sequence[str] = ()) -> Optional[str]:
+    """The category's canonical spelling, matched without case: a built-in (parser.CATEGORIES) or one of your
+    `custom` categories (categories.names_for); None for an unknown name or Uncategorized (a rule must set a
+    category)."""
+    category = categories.canonical(name, custom)
+    return None if category == UNCATEGORIZED else category
 
 
 @dataclass(frozen=True)
@@ -330,7 +333,7 @@ class _RuleFields(BaseModel):
     sms_words: Optional[str] = Field(default=None, description="Words in the SMS text")
     min_amount: Optional[Decimal] = Field(default=None, description="Smallest INR amount, inclusive")
     direction: Optional[Literal["DEBIT", "CREDIT"]] = Field(default=None, description="null = money out or in")
-    category: str = Field(description="Any category except Uncategorized")
+    category: str = Field(description="Any category except Uncategorized, yours included")
 
     @model_validator(mode="before")
     @classmethod
@@ -366,10 +369,11 @@ class _RuleFields(BaseModel):
     @field_validator("category")
     @classmethod
     def _category(cls, value: str) -> str:
-        category = valid_category(value)
-        if category is None:
+        # Checked against the list in the routes (_category), which know your own categories.
+        value = value.strip()
+        if not value:
             raise ValueError("Pick a category from the list.")
-        return category
+        return value
 
     @model_validator(mode="after")
     def _a_condition(self):
@@ -432,9 +436,17 @@ def _example(row) -> RuleExample:
                        currency=row.currency, transaction_time=_utc(row.transaction_time), category=row.category)
 
 
-def _fields(body: _RuleFields) -> dict:
+async def _category(db: AsyncSession, user: User, body: _RuleFields) -> str:
+    """The rule's category in its stored spelling, a built-in or one of yours; 422 otherwise."""
+    category = valid_category(body.category, await categories.names_for(db, user))
+    if category is None:
+        raise HTTPException(422, "Pick a category from the list.")
+    return category
+
+
+def _fields(body: _RuleFields, category: str) -> dict:
     return {"merchant_words": body.merchant_words, "sms_words": body.sms_words, "min_amount": body.min_amount,
-            "direction": body.direction, "category": body.category}
+            "direction": body.direction, "category": category}
 
 
 # ---------- Merged names API ----------
@@ -498,15 +510,16 @@ async def list_rules(user: User = Depends(current_user), db: AsyncSession = Depe
 async def preview_rule(body: RulePreviewIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     """The past payments this rule would change if applied, and up to 5 of them, newest first. With `id`
     (editing a rule) it takes that rule's place in the order; without, it's the newest. Writes nothing."""
+    category = await _category(db, user, body)
     existing = await _owner_rules(db, user.id)
     if body.id is not None:
         stored = next((rule for rule in existing if rule.id == body.id), None)
         if stored is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Rule not found.")
-        target = RuleView(id=body.id, created_at=stored.created_at, **_fields(body))
+        target = RuleView(id=body.id, created_at=stored.created_at, **_fields(body, category))
         ordered = with_rule(existing, target, replace_id=body.id)
     else:
-        target = RuleView(id=None, created_at=utc_now(), **_fields(body))
+        target = RuleView(id=None, created_at=utc_now(), **_fields(body, category))
         ordered = with_rule(existing, target)
     candidates = await _past_candidates(db, user, target, ordered)
     newest = sorted(candidates, key=lambda row: _utc(row.transaction_time), reverse=True)[:EXAMPLES]
@@ -534,9 +547,10 @@ async def create_rule(body: CategoryRuleIn, background_tasks: BackgroundTasks, u
                       db: AsyncSession = Depends(get_db)):
     """Adds a rule, the newest, so it's tried first. With `apply_to_past`, past payments it now decides get
     its category too (see the preview)."""
+    category = await _category(db, user, body)
     existing = await _owner_rules(db, user.id)
     now = utc_now()
-    row = CategoryRule(user_id=user.id, created_at=now, updated_at=now, **_fields(body))
+    row = CategoryRule(user_id=user.id, created_at=now, updated_at=now, **_fields(body, category))
     db.add(row)
     await db.flush()
     return await _save_rule(db, user, row, existing, False, body.apply_to_past, background_tasks)
@@ -549,8 +563,9 @@ async def update_rule(rule_id: uuid.UUID, body: CategoryRuleIn, background_tasks
     row = await db.scalar(select(CategoryRule).where(CategoryRule.id == rule_id, CategoryRule.user_id == user.id))
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Rule not found.")
+    category = await _category(db, user, body)
     existing = await _owner_rules(db, user.id)
-    for field, value in _fields(body).items():
+    for field, value in _fields(body, category).items():
         setattr(row, field, value)
     row.updated_at = utc_now()
     await db.flush()

@@ -20,9 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, init_db
 from models import Transaction, User
+import categories
 import categorize
 import duplicates
+import goals
 import jobs
+import ledger
 import limits
 import low_balance
 import payment_alerts
@@ -34,7 +37,7 @@ import safe_to_spend
 import settings_store
 import upcoming
 import watchdog
-from parser import (CATEGORIES, UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
+from parser import (UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
                     detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, affects_bank_balance, owner_balance, router as balance_router
@@ -101,6 +104,7 @@ app.include_router(balance_router)
 app.include_router(jobs.router)
 app.include_router(limits_router)
 app.include_router(notifications_router)
+app.include_router(ledger.router)
 app.include_router(periods_router)
 app.include_router(rules.names_router)
 app.include_router(rules.rules_router)
@@ -109,6 +113,8 @@ app.include_router(recurring.router)
 app.include_router(upcoming.router)
 app.include_router(safe_to_spend.router)
 app.include_router(refunds.router)
+app.include_router(goals.router)
+app.include_router(categories.router)
 
 
 @app.middleware("http")
@@ -176,6 +182,7 @@ class TransactionResponse(BaseModel):
     duplicate_of: Optional[uuid.UUID] = None  # the earlier transaction while this one is held out as a possible duplicate
     refund: Optional[Literal["expected", "refunded"]] = None  # a payment you expect money back for, and whether it came
     refund_for: Optional[uuid.UUID] = None  # on a credit you confirmed as a refund: the payment it refunded
+    linked_amount: float = 0  # Σ of its lend & borrow entries (ledger.py); totals count amount − this
 
     @computed_field
     @property
@@ -417,12 +424,13 @@ class _TransactionChecks(BaseModel):
     @field_validator("category", check_fields=False)
     @classmethod
     def _category(cls, value: Optional[str]) -> Optional[str]:
+        # Checked against the list in the routes (_known_category), which know your own categories.
         if value is None:
             return None
-        match = next((c for c in CATEGORIES if c.casefold() == value.strip().casefold()), None)
-        if match is None:
+        value = value.strip()
+        if not value:
             raise ValueError("Unknown category.")
-        return match
+        return value
 
     @field_validator("transaction_time", check_fields=False)
     @classmethod
@@ -433,6 +441,14 @@ class _TransactionChecks(BaseModel):
         if value > datetime.now(timezone.utc) + timedelta(minutes=5):
             raise ValueError("The date and time can't be in the future.")
         return value.astimezone(timezone.utc)
+
+
+async def _known_category(db: AsyncSession, user: User, value: str) -> str:
+    """The category's stored spelling: a built-in (Uncategorized included) or one of yours; 422 otherwise."""
+    category = categories.canonical(value, await categories.names_for(db, user))
+    if category is None:
+        raise HTTPException(422, "Unknown category.")
+    return category
 
 
 class ManualTransactionInput(_TransactionChecks):
@@ -477,10 +493,11 @@ async def add_transaction(
     then Gemini in the background. A possible duplicate of an SMS is held out of totals until you
     decide (duplicates.py)."""
     now = datetime.now(timezone.utc)
+    chosen = await _known_category(db, user, body.category) if body.category else None
     to_name, category_rules = await rules.load_owner_rules(db, user.id, body.merchant)
     merchant = to_name or body.merchant
-    if body.category:
-        category = body.category
+    if chosen:
+        category = chosen
         await categorize.remember(db, user.id, merchant, body.type, category)
     else:
         hit = rules.first_match(category_rules, merchant, None, body.amount, "INR", body.type)
@@ -541,12 +558,25 @@ async def edit_transaction(
     changes = body.model_dump(exclude_none=True)
     if not changes:
         return TransactionResponse.model_validate(txn)
+    # Lock and reload before the checks below, so a lend & borrow save at the same time can't slip in between.
+    txn = await ledger.lock_transaction(db, user, transaction_id)
+    if txn is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
+    linked = Decimal(str(txn.linked_amount or 0))
+    if linked > 0:  # entries are a share of this payment or credit (ledger.py)
+        if "type" in changes and changes["type"] != txn.type:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Remove its lend & borrow entries first.")
+        if "amount" in changes and changes["amount"] < linked:
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                f"The amount can't be less than the {limits.format_money(linked, 'INR')} in lend & borrow entries.")
     if "paid_with" in changes:
         if txn.parsed_by != MANUAL:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Only transactions you added by hand can switch between bank and cash.")
         txn.account_ref = CASH_ACCOUNT if changes.pop("paid_with") == "cash" else None
     if "notes" in changes:
         changes["notes"] = changes["notes"] or None
+    if "category" in changes:
+        changes["category"] = await _known_category(db, user, changes["category"])
     for field, value in changes.items():
         setattr(txn, field, value)
     if not txn.is_parsed and txn.amount > 0:
@@ -597,12 +627,14 @@ async def delete_transaction(
 ):
     """Deletes an SMS or a hand-added entry for good. If the Shortcut sends the same SMS again,
     it's recorded again. Deleting the earlier of two possible duplicates makes the other count again; a
-    payment's refund watch goes with it, and deleting a confirmed refund makes its payment's watch open again."""
+    payment's refund watch goes with it, and deleting a confirmed refund makes its payment's watch open again. Its
+    lend & borrow entries go with it (cash entries stay)."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
     released = await duplicates.release(db, txn.id)  # same commit as the delete
     await refunds.release(db, txn.id)  # same commit as the delete
+    await ledger.release(db, txn.id)  # same commit as the delete
     await db.delete(txn)
     await db.commit()
     for released_id in released:  # they count again: the after-save checks run

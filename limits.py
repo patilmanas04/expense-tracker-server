@@ -9,9 +9,20 @@ limit, period, limit amount and level (keys spend_warn:…). The rule is state-b
 edit, AI retry, merge, Not a duplicate) gives the same answer.
 
 "Spent" matches the app: parsed debits in the limit's currency, card spends included, except categories that aren't spending (spending.py: Credit Card Payment, Self Transfer, Investments & Finance), and not possible duplicates waiting for your decision (duplicates.py).
+Each payment counts minus its lend & borrow entries (ledger.py; spending.counted_amount): your ₹600 share of a ₹1,800
+dinner you split counts ₹600.
 Weeks run Monday to Sunday (IST). Months follow the calendar, or pay periods when 'Month starts on payday' is on
 (pay_periods.py; current_windows).
 Which payments a merchant limit counts is decided in merchants.py.
+
+Rollover (limit_rollovers, PUT /rollover): a monthly limit, overall or per category, can roll over. Its limit then
+adds what you didn't spend of last month's limit, or takes off what you overspent, clamped between ₹0 and twice the
+limit: rollover_limit(base, previous) = base + max(−base, min(base, base − previous)). "Last month" is the previous
+monthly window (the previous pay period with 'Month starts on payday' on; no carry when there is none), and carry
+starts with the first month that begins after the IST day it was turned on. The summary shows the rollover limit
+(with `base` and `carried`); alerts compare spending with it, but their keys (and SpendAlert.limit_amount) use the
+base limit, so a late SMS for last month that changes the carry never sends the same alert twice. Weekly and
+merchant limits never roll over.
 
 The checks run after each saved payment through post_save.py (post_save_check, registered in main.py for every
 cause); check_spend_limits runs them alone, for rules.py's merges and rule applies.
@@ -29,10 +40,11 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import String, delete, exists, func, literal, or_, select, union_all, update
+from sqlalchemy import String, and_, delete, exists, func, literal, or_, select, union_all, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import categories
 import mailer
 import merchants
 import pay_periods
@@ -40,12 +52,12 @@ import post_save
 from auth import FRONTEND_URL, current_user, same_origin
 from dashboard import ownership
 from database import AsyncSessionLocal, get_db
-from models import (CategoryLimit, KnownMerchant, MerchantCategory, MerchantLimit, Notification, SpendAlert,
-                    SpendLimit, Transaction, User)
+from models import (CategoryLimit, KnownMerchant, LimitRollover, MerchantCategory, MerchantLimit, Notification,
+                    SpendAlert, SpendLimit, Transaction, User)
 from notifications import create_once
 from parser import CATEGORIES, UNCATEGORIZED
 from post_save import PostSave
-from spending import EXCLUDED_FROM_SPENDING, counted_filter, counts_as_spending
+from spending import EXCLUDED_FROM_SPENDING, counted_amount, counted_filter, counts_as_spending, linked_totals
 
 router = APIRouter(prefix="/api/v1/limits", tags=["Spend limits"])
 logger = logging.getLogger(__name__)
@@ -57,10 +69,11 @@ MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14, 2)
 MAX_MERCHANT_LENGTH = 255  # String(255)
 LABEL_LENGTH = 120  # a merchant's name in a notification title, which holds 200 characters
 ALL = "All"  # the overall limit, across every category
+SCOPE_MESSAGE = "Pick a spending category, or All."
 # Limits apply to spending, so money-in categories, Uncategorized and categories that aren't spending
-# (spending.py) can't have one.
-LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in (UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback")
-                    and c not in EXCLUDED_FROM_SPENDING]
+# (spending.py) can't have one. Your own categories (categories.py) can.
+NOT_LIMITABLE = frozenset({UNCATEGORIZED, "Salary", "Income", "Refunds & Cashback"}) | EXCLUDED_FROM_SPENDING
+LIMIT_CATEGORIES = [c for c in CATEGORIES if c not in NOT_LIMITABLE]
 
 
 def utc_now() -> datetime:
@@ -128,7 +141,10 @@ def format_money(amount: Decimal, currency: str) -> str:
 
 
 def _spent_query(user: User, currency: str, start: datetime, end: datetime, category: Optional[str] = None):
-    query = select(func.coalesce(func.sum(Transaction.amount), 0)).where(
+    linked = linked_totals()  # each payment counts minus its lend & borrow entries
+    query = select(func.coalesce(func.sum(counted_amount(linked)), 0)).select_from(Transaction).outerjoin(
+        linked, linked.c.transaction_id == Transaction.id
+    ).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
@@ -176,15 +192,54 @@ def _merchant_warning_key(limit_id: uuid.UUID, period: str, start: date, limit: 
 
 def _warns(spent: Decimal, limit: Decimal, warn_percent: Optional[int]) -> bool:
     """At or above the warning level (callers check the limit first). Exact in Decimal, no division."""
-    return warn_percent is not None and spent * 100 >= limit * warn_percent
+    return warn_percent is not None and limit > 0 and spent * 100 >= limit * warn_percent
+
+
+def _reached(spent: Decimal, limit: Decimal) -> bool:
+    # A rollover limit can be ₹0: nothing spent hasn't reached it.
+    return spent >= limit and spent > 0
+
+
+def _percent(spent: Decimal, limit: Decimal) -> int:
+    """Spent as a whole percent of the limit; 100 for a ₹0 (rollover) limit."""
+    return int(spent * 100 / limit) if limit else 100
+
+
+def rollover_limit(base: Decimal, previous_spent: Decimal) -> Decimal:
+    """This month's limit when it rolls over: the base plus last month's unspent amount, or minus its overspend,
+    between ₹0 and twice the base."""
+    return base + max(-base, min(base, base - previous_spent))
+
+
+def previous_monthly_window(windows: dict[str, Optional[Window]]) -> Optional[Window]:
+    """Last month's window: the previous pay period when 'Month starts on payday' is on (None when there is none),
+    else the calendar month before."""
+    if "previous_monthly" in windows:
+        return windows["previous_monthly"]
+    return period_window("monthly", windows["monthly"][1] - timedelta(seconds=1))
+
+
+def carry_applies(monthly_limit: Optional[Decimal], rollover_since: Optional[datetime],
+                  windows: dict[str, Optional[Window]]) -> bool:
+    """Whether this month's limit carries last month's: rollover is on, there is a monthly limit, the month began
+    after the IST day rollover was turned on, and there is a previous month."""
+    if monthly_limit is None or rollover_since is None:
+        return False
+    if _utc(rollover_since).astimezone(IST).date() >= windows["monthly"][0]:
+        return False
+    return previous_monthly_window(windows) is not None
 
 
 def merchant_debits(user: User, currency: str, since: Optional[datetime] = None):
     """(merchant, amount, time) of every payment a merchant limit can count. The summary, the
     alert check, known merchants and the preview all read through this, so they always agree.
     Only counted spending (spending.counted_filter), so a merchant paid only in excluded categories isn't
-    known and its limit shows ₹0, and a possible duplicate waiting for your decision isn't counted."""
-    query = select(Transaction.merchant, Transaction.amount, Transaction.transaction_time).where(
+    known and its limit shows ₹0, and a possible duplicate waiting for your decision isn't counted. The amount is
+    the counted amount: the payment minus its lend & borrow entries (ledger.py)."""
+    linked = linked_totals()  # each payment counts minus its lend & borrow entries
+    query = select(
+        Transaction.merchant, counted_amount(linked).label("amount"), Transaction.transaction_time
+    ).select_from(Transaction).outerjoin(linked, linked.c.transaction_id == Transaction.id).where(
         ownership(user),
         Transaction.is_parsed.is_(True),
         Transaction.type == "DEBIT",
@@ -243,21 +298,31 @@ class Rule:
     currency: str
     weekly_limit: Optional[Decimal]
     monthly_limit: Optional[Decimal]
+    rollover_since: Optional[datetime] = None  # when rollover was turned on; None = off
 
 
 async def load_rules(db: AsyncSession, user_id: uuid.UUID) -> list[Rule]:
-    """The overall limit and every category limit, in one query. Overall first, then list order.
+    """The overall limit and every category limit, with their rollover rows, in one query. Overall first, then the
+    built-ins in list order, then your own categories by name.
     Category limits on categories that can no longer have one (left from before spending.py) are
     skipped; scripts/recategorise_card_payments.py deletes them."""
     overall = select(
-        literal(ALL, String).label("category"), SpendLimit.currency, SpendLimit.weekly_limit, SpendLimit.monthly_limit
+        literal(ALL, String).label("category"), SpendLimit.currency, SpendLimit.weekly_limit, SpendLimit.monthly_limit,
+        LimitRollover.enabled_at,
+    ).select_from(SpendLimit).outerjoin(
+        LimitRollover, and_(LimitRollover.user_id == SpendLimit.user_id, LimitRollover.category == ALL)
     ).where(SpendLimit.user_id == user_id)
     per_category = select(
-        CategoryLimit.category, CategoryLimit.currency, CategoryLimit.weekly_limit, CategoryLimit.monthly_limit
-    ).where(CategoryLimit.user_id == user_id, CategoryLimit.category.in_(LIMIT_CATEGORIES))
-    rules = [Rule(*row) for row in (await db.execute(union_all(overall, per_category))).all()]
+        CategoryLimit.category, CategoryLimit.currency, CategoryLimit.weekly_limit, CategoryLimit.monthly_limit,
+        LimitRollover.enabled_at,
+    ).select_from(CategoryLimit).outerjoin(
+        LimitRollover, and_(LimitRollover.user_id == CategoryLimit.user_id, LimitRollover.category == CategoryLimit.category)
+    ).where(CategoryLimit.user_id == user_id, CategoryLimit.category.not_in(sorted(NOT_LIMITABLE)))
+    rows = (await db.execute(union_all(overall, per_category))).all()
+    rules = [Rule(*row[:4], _utc(row[4]) if row[4] is not None else None) for row in rows]
     order = {name: i for i, name in enumerate([ALL, *LIMIT_CATEGORIES])}
-    return sorted(rules, key=lambda rule: order.get(rule.category, len(order)))
+    # Built-ins in list order, then your own categories by name.
+    return sorted(rules, key=lambda rule: (order.get(rule.category, len(order)), rule.category.casefold(), rule.category))
 
 
 def _window_text(start: date, end_utc: datetime) -> str:
@@ -288,6 +353,22 @@ def _encodable(data):
     return {key: merchants.mark_invalid_characters(value) if isinstance(value, str) else value for key, value in data.items()}
 
 
+def _limit_scope(value: Optional[str]) -> Optional[str]:
+    """None for the overall limit (empty or "All"), else the name as typed (trimmed); the routes check it with
+    limit_category, which knows your own categories."""
+    value = (value or "").strip()
+    return None if not value or value.casefold() == ALL.casefold() else value
+
+
+async def limit_category(db: AsyncSession, user: User, value: str, message: str) -> str:
+    """A category that can have a limit, in its stored spelling: a spending built-in or one of yours; 422 with
+    `message` otherwise."""
+    category = categories.canonical(value, await categories.names_for(db, user))
+    if category is None or category in NOT_LIMITABLE:
+        raise HTTPException(422, message)
+    return category
+
+
 class LimitsInput(BaseModel):
     category: Optional[str] = Field(default=None, description='A spending category; omit or "All" for overall spending')
     weekly_limit: Optional[Decimal] = _limit_field()  # null = no limit
@@ -301,13 +382,7 @@ class LimitsInput(BaseModel):
     @field_validator("category")
     @classmethod
     def _category(cls, value: Optional[str]) -> Optional[str]:
-        wanted = (value or "").strip().casefold()
-        if not wanted or wanted == ALL.casefold():
-            return None  # overall
-        match = next((c for c in LIMIT_CATEGORIES if c.casefold() == wanted), None)
-        if match is None:
-            raise ValueError("Pick a spending category, or All.")
-        return match
+        return _limit_scope(value)
 
 
 class MerchantLimitInput(BaseModel):
@@ -337,22 +412,33 @@ class MerchantLimitInput(BaseModel):
     @field_validator("category")
     @classmethod
     def _category(cls, value: Optional[str]) -> Optional[str]:
-        wanted = (value or "").strip().casefold()
-        if not wanted:
-            return None
-        # Spending categories only: Uncategorized would make merchant memory forget the merchant.
-        match = next((c for c in LIMIT_CATEGORIES if c.casefold() == wanted), None)
-        if match is None:
-            raise ValueError("Pick a spending category.")
-        return match
+        # Spending categories only (checked in the route): Uncategorized would make merchant memory forget it.
+        return (value or "").strip() or None
+
+
+class RolloverInput(BaseModel):
+    category: Optional[str] = Field(default=None, description='A spending category; omit or "All" for the overall limit')
+    enabled: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def _mark_invalid_characters(cls, data):
+        return _encodable(data)
+
+    @field_validator("category")
+    @classmethod
+    def _category(cls, value: Optional[str]) -> Optional[str]:
+        return _limit_scope(value)
 
 
 class PeriodStatus(BaseModel):
-    limit: Optional[float]
+    limit: Optional[float]  # the rollover limit when carry applies (may be 0.0)
     spent: float
     start: date
     end: date  # last day, inclusive
     alerted: bool  # notification created for this period and limit
+    base: Optional[float] = None  # monthly with carry only: the limit as set
+    carried: Optional[float] = None  # monthly with carry only: limit − base (negative after an overspent month)
 
 
 class EmailStatus(BaseModel):
@@ -365,6 +451,7 @@ class CategoryStatus(BaseModel):
     category: str
     weekly: PeriodStatus
     monthly: PeriodStatus
+    rollover: bool = False  # rollover is on for this category's monthly limit
 
 
 class MerchantLimitStatus(BaseModel):
@@ -382,6 +469,7 @@ class LimitsSummary(BaseModel):
     categories: list[CategoryStatus] = []  # only categories with a limit
     merchants: list[MerchantLimitStatus] = []  # oldest first
     email: EmailStatus
+    rollover: bool = False  # rollover is on for the overall monthly limit
 
 
 class KnownMerchantOut(BaseModel):
@@ -398,21 +486,26 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
                     merchant_limits: Sequence[MerchantLimit] = ()) -> LimitsSummary:
     """Every meter, overall and per category, in a single query: the database may be a continent
     away, so each round trip costs far more than the work itself. Merchant limits add their
-    "notified" flags to that query and one read of your debits, matched here in Python."""
+    "notified" flags to that query and one read of your debits, matched here in Python. A monthly
+    limit that rolls over adds last month's spending to the same query."""
     now = utc_now()
     overall = next((rule for rule in rules if rule.category == ALL), None)
     per_category = [rule for rule in rules if rule.category != ALL]
     currency = overall.currency if overall else "INR"
     windows = await current_windows(db, user, now)
+    previous = previous_monthly_window(windows)
 
     def amounts(rule: Optional[Rule]) -> dict[str, Optional[Decimal]]:
         return {period: getattr(rule, f"{period}_limit") if rule else None for period in PERIODS}
 
-    # (column prefix, category or None for overall, currency, limits)
-    meters = [("all", None, currency, amounts(overall))]
-    meters += [(f"c{i}", rule.category, rule.currency, amounts(rule)) for i, rule in enumerate(per_category)]
+    def carries(rule: Optional[Rule]) -> bool:
+        return rule is not None and carry_applies(rule.monthly_limit, rule.rollover_since, windows)
+
+    # (column prefix, category or None for overall, currency, limits, rule)
+    meters = [("all", None, currency, amounts(overall), overall)]
+    meters += [(f"c{i}", rule.category, rule.currency, amounts(rule), rule) for i, rule in enumerate(per_category)]
     columns = []
-    for prefix, category, meter_currency, limits in meters:
+    for prefix, category, meter_currency, limits, rule in meters:
         for period in PERIODS:
             start_date, start, end = windows[period]
             limit = limits[period]
@@ -427,6 +520,10 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
                 columns.append(select(SpendAlert.error).where(
                     *_alert_key(user.id, period, start_date, limit), SpendAlert.status == "failed",
                 ).scalar_subquery().label(f"{prefix}_{period}_error"))
+        if carries(rule):
+            _, prev_start, prev_end = previous
+            columns.append(_spent_query(user, meter_currency, prev_start, prev_end, category).scalar_subquery()
+                           .label(f"{prefix}_monthly_prev"))
     for i, rule in enumerate(merchant_limits):
         for period, limit in amounts(rule).items():
             if limit:
@@ -436,19 +533,29 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
                 ).label(f"m{i}_{period}_alerted"))
     row = (await db.execute(select(*columns))).one()._mapping
 
-    def period_status(period: str, limit: Optional[Decimal], spent, alerted) -> PeriodStatus:
+    def period_status(period: str, limit: Optional[Decimal], spent, alerted, previous_spent=None) -> PeriodStatus:
+        """`previous_spent` (monthly with carry only): the shown limit is the rollover limit; `alerted` stays keyed
+        on the base limit, as the alerts are."""
         start_date, _, end = windows[period]
+        shown, base, carried = limit, None, None
+        if limit is not None and previous_spent is not None:
+            shown = rollover_limit(limit, _money(previous_spent))
+            base, carried = float(limit), float(shown - limit)
         return PeriodStatus(
-            limit=float(limit) if limit else None,
+            limit=float(shown) if shown is not None else None,
             spent=float(_money(spent)),
             start=start_date,
             end=_last_day(end),
             alerted=bool(limit) and bool(alerted),
+            base=base,
+            carried=carried,
         )
 
-    def statuses(prefix: str, limits: dict[str, Optional[Decimal]]) -> dict[str, PeriodStatus]:
+    def statuses(prefix: str, limits: dict[str, Optional[Decimal]], rule: Optional[Rule]) -> dict[str, PeriodStatus]:
+        previous_spent = row[f"{prefix}_monthly_prev"] if carries(rule) else None
         return {period: period_status(period, limits[period], row[f"{prefix}_{period}_spent"],
-                                      limits[period] and row[f"{prefix}_{period}_alerted"])
+                                      limits[period] and row[f"{prefix}_{period}_alerted"],
+                                      previous_spent if period == "monthly" else None)
                 for period in PERIODS}
 
     merchant_statuses = []
@@ -468,11 +575,12 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
     # The monthly failure wins over the weekly one, as before.
     last_error = next((row[f"all_{period}_error"] for period in reversed(PERIODS)
                        if overall_limits[period] and row[f"all_{period}_error"] is not None), None)
-    overall_status = statuses("all", overall_limits)
+    overall_status = statuses("all", overall_limits, overall)
     categories = []
-    for prefix, category, _, limits in meters[1:]:
-        status = statuses(prefix, limits)
-        categories.append(CategoryStatus(category=category, weekly=status["weekly"], monthly=status["monthly"]))
+    for prefix, category, _, limits, rule in meters[1:]:
+        status = statuses(prefix, limits, rule)
+        categories.append(CategoryStatus(category=category, weekly=status["weekly"], monthly=status["monthly"],
+                                         rollover=rule.rollover_since is not None))
     return LimitsSummary(
         currency=currency,
         weekly=overall_status["weekly"],
@@ -480,6 +588,7 @@ async def summarize(db: AsyncSession, user: User, rules: list[Rule],
         categories=categories,
         merchants=merchant_statuses,
         email=EmailStatus(configured=mailer.configured(), to=mailer.recipient() or None, last_error=last_error),
+        rollover=overall is not None and overall.rollover_since is not None,
     )
 
 
@@ -497,10 +606,12 @@ async def get_limits(user: User = Depends(current_user), db: AsyncSession = Depe
 @router.put("", response_model=LimitsSummary, dependencies=[Depends(same_origin)])
 async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     """Sets the overall limit, or one category's when `category` is given. Leaving both amounts
-    empty removes a category's limit."""
-    category = body.category
+    empty removes a category's limit. Removing a limit, or its monthly amount, turns its rollover off."""
+    category = await limit_category(db, user, body.category, SCOPE_MESSAGE) if body.category else None
+    rollover_row = delete(LimitRollover).where(LimitRollover.user_id == user.id, LimitRollover.category == (category or ALL))
     if category and body.weekly_limit is None and body.monthly_limit is None:
         await db.execute(delete(CategoryLimit).where(CategoryLimit.user_id == user.id, CategoryLimit.category == category))
+        await db.execute(rollover_row)
         await db.commit()
         return await _summary(db, user)
 
@@ -518,6 +629,8 @@ async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: 
                 db.add(rule)
         rule.weekly_limit = body.weekly_limit
         rule.monthly_limit = body.monthly_limit
+        if body.monthly_limit is None:
+            await db.execute(rollover_row)  # nothing left to roll over
         await db.commit()
 
     try:
@@ -525,6 +638,35 @@ async def set_limits(body: LimitsInput, user: User = Depends(current_user), db: 
     except IntegrityError:
         await db.rollback()  # two saves raced to create the row; update the winner
         await save()
+    return await _summary(db, user)
+
+
+@router.put("/rollover", response_model=LimitsSummary, dependencies=[Depends(same_origin)])
+async def set_rollover(body: RolloverInput, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    """Turns rollover on or off for the overall monthly limit, or a category's. Turning it on needs a monthly
+    limit; when it is already on, the first `enabled_at` is kept. Turning it off always succeeds."""
+    user_id = user.id  # read now: the rollback below expires `user`, which may share this session
+    category = await limit_category(db, user, body.category, SCOPE_MESSAGE) if body.category else None
+    scope = category or ALL
+    where = (LimitRollover.user_id == user_id, LimitRollover.category == scope)
+    if not body.enabled:
+        await db.execute(delete(LimitRollover).where(*where))
+        await db.commit()
+        return await _summary(db, user)
+    if category:
+        monthly = await db.scalar(select(CategoryLimit.monthly_limit).where(
+            CategoryLimit.user_id == user_id, CategoryLimit.category == category))
+    else:
+        monthly = await db.scalar(select(SpendLimit.monthly_limit).where(SpendLimit.user_id == user_id))
+    if monthly is None:
+        raise HTTPException(422, "Set a monthly limit first.")
+    if await db.scalar(select(LimitRollover.id).where(*where)) is None:
+        db.add(LimitRollover(user_id=user_id, category=scope, enabled_at=utc_now()))
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()  # turned on twice at once: the first row stays
+            user = await db.get(User, user_id) or user
     return await _summary(db, user)
 
 
@@ -539,6 +681,7 @@ async def set_merchant_limit(body: MerchantLimitInput, user: User = Depends(curr
 
     name, key = body.merchant, merchants.name_hash(body.merchant)
     clear = body.weekly_limit is None and body.monthly_limit is None
+    category = await limit_category(db, user, body.category, "Pick a spending category.") if body.category else None
 
     async def save() -> None:
         if body.id is not None:
@@ -561,7 +704,7 @@ async def set_merchant_limit(body: MerchantLimitInput, user: User = Depends(curr
         if clear:
             return  # nothing to remove
         if not await _is_known(db, user, name):
-            if body.category is None:
+            if category is None:
                 raise HTTPException(422, "Pick a category for this new merchant.")
             db.add(KnownMerchant(user_id=user.id, name=name, name_hash=key))
             # Memory ignores case, so a typed "swiggy" mustn't change the category "Swiggy" already has.
@@ -571,7 +714,7 @@ async def set_merchant_limit(body: MerchantLimitInput, user: User = Depends(curr
                 MerchantCategory.type == "DEBIT",
             ))
             if remembered is None:
-                await categorize.remember(db, user.id, name, "DEBIT", body.category)
+                await categorize.remember(db, user.id, name, "DEBIT", category)
         db.add(MerchantLimit(user_id=user.id, merchant=name, merchant_hash=key, currency="INR",
                              weekly_limit=body.weekly_limit, monthly_limit=body.monthly_limit))
         await db.commit()
@@ -666,7 +809,7 @@ def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_
     of_limit = f"{period} {label} limit" if label else name.lower()
     noun = "week" if period == "weekly" else "month"
     state = "reached" if spent == limit else "crossed"
-    percent = int(spent * 100 / limit)
+    percent = _percent(spent, limit)
     window = _window_text(start, end_utc)
     when = _utc(txn.transaction_time).astimezone(IST)
     latest_where = txn.merchant or txn.category or "a payment"
@@ -692,10 +835,14 @@ def compose_alert(period: str, limit: Decimal, spent: Decimal, start: date, end_
 
 
 async def _alert_once(db: AsyncSession, user: User, period: str, start: date, end: datetime,
-                      limit: Decimal, spent: Decimal, txn: Transaction, currency: str) -> None:
-    alert = await db.scalar(select(SpendAlert).where(*_alert_key(user.id, period, start, limit)))
+                      limit: Decimal, spent: Decimal, txn: Transaction, currency: str,
+                      key_limit: Optional[Decimal] = None) -> None:
+    """`limit` is the limit the email shows (a rollover limit); `key_limit` the one the alert is kept under (the
+    base limit; defaults to `limit`)."""
+    key_limit = limit if key_limit is None else key_limit
+    alert = await db.scalar(select(SpendAlert).where(*_alert_key(user.id, period, start, key_limit)))
     if alert is None:
-        alert = SpendAlert(user_id=user.id, period=period, period_start=start, limit_amount=limit,
+        alert = SpendAlert(user_id=user.id, period=period, period_start=start, limit_amount=key_limit,
                            spent_amount=spent, status="sending", attempts=0)
         db.add(alert)
         try:
@@ -749,7 +896,7 @@ async def _notify_once(db: AsyncSession, user: User, period: str, start: date, e
         kind=kind,
         title=title,
         body=(f"{format_money(spent, currency)} of {format_money(limit, currency)}{on} this {noun} "
-              f"({_window_text(start, end)}) · {int(spent * 100 / limit)}%"),
+              f"({_window_text(start, end)}) · {_percent(spent, limit)}%"),
         link="/settings/limits",
         dedupe_key=key,
     )
@@ -764,7 +911,7 @@ async def post_save_check(ctx: PostSave) -> None:
     now, when = utc_now(), _utc(txn.transaction_time)
     warn_percent = ctx.settings["limits.warn_percent"]  # None = warnings Off
     windows = await current_windows(db, owner, now, ctx.settings.get("periods.payday", False))
-    setting = await _setting(db, owner.id)
+    setting, rollover_since = await _overall_limit(db, owner.id)
     if setting is not None and txn.currency == setting.currency:
         currency = setting.currency
         limits = {period: getattr(setting, f"{period}_limit") for period in PERIODS}
@@ -776,18 +923,44 @@ async def post_save_check(ctx: PostSave) -> None:
             if not start <= when < end:
                 continue  # a late SMS for a past week/month doesn't alert
             spent = await spent_between(db, owner, currency, start, end)
-            if spent >= limit:
-                await _notify_once(db, owner, period, start_date, end, limit, spent, currency)
+            effective = await _effective_limit(db, owner, currency, period, limit, rollover_since, windows)
+            if _reached(spent, effective):
+                await _notify_once(db, owner, period, start_date, end, effective, spent, currency,
+                                   dedupe_key=_notification_key(period, start_date, limit))
                 # Email is optional: with no Gmail keys nothing is recorded, so it still goes out once configured.
                 if mailer.configured():
-                    await _alert_once(db, owner, period, start_date, end, limit, spent, txn, currency)
-            elif _warns(spent, limit, warn_percent):  # in-app only, never emailed
-                await _notify_once(db, owner, period, start_date, end, limit, spent, currency, warn_percent=warn_percent)
+                    await _alert_once(db, owner, period, start_date, end, effective, spent, txn, currency, key_limit=limit)
+            elif _warns(spent, effective, warn_percent):  # in-app only, never emailed
+                await _notify_once(db, owner, period, start_date, end, effective, spent, currency,
+                                   dedupe_key=_warning_key(period, start_date, limit, warn_percent),
+                                   warn_percent=warn_percent)
     await _check_category(db, owner, txn, windows, when, warn_percent)
     try:  # last and on its own, so a failure here can't stop the overall and category alerts
         await _check_merchants(db, owner, txn, windows, when, warn_percent)
     except Exception:
         logger.exception("Merchant limit check failed")
+
+
+async def _overall_limit(db: AsyncSession, user_id: uuid.UUID) -> tuple[Optional[SpendLimit], Optional[datetime]]:
+    """The overall limit and when its rollover was turned on (None = off), in one statement."""
+    row = (await db.execute(
+        select(SpendLimit, LimitRollover.enabled_at).outerjoin(
+            LimitRollover, and_(LimitRollover.user_id == SpendLimit.user_id, LimitRollover.category == ALL)
+        ).where(SpendLimit.user_id == user_id)
+    )).first()
+    return (None, None) if row is None else (row[0], row[1])
+
+
+async def _effective_limit(db: AsyncSession, owner: User, currency: str, period: str, limit: Decimal,
+                           rollover_since: Optional[datetime], windows: dict[str, Optional[Window]],
+                           category: Optional[str] = None) -> Decimal:
+    """The limit spending is compared with: the rollover limit for a monthly limit that carries (one more query,
+    last month's spending), else the limit as set."""
+    if period != "monthly" or not carry_applies(limit, rollover_since, windows):
+        return limit
+    _, previous_start, previous_end = previous_monthly_window(windows)
+    previous = await spent_between(db, owner, currency, previous_start, previous_end, category)
+    return rollover_limit(limit, previous)
 
 
 async def _check(db: AsyncSession, transaction_id: uuid.UUID) -> None:
@@ -801,11 +974,17 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, windo
                           when: datetime, warn_percent: Optional[int]) -> None:
     """The limit on this transaction's category: a notification, plus one best-effort email; or the in-app
     warning at `warn_percent` (None = Off) while still under it."""
-    if txn.category not in LIMIT_CATEGORIES:
+    if txn.category is None or txn.category in NOT_LIMITABLE:
         return
-    rule = await db.scalar(select(CategoryLimit).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category))
-    if rule is None or rule.currency != txn.currency:
+    found = (await db.execute(
+        select(CategoryLimit, LimitRollover.enabled_at).outerjoin(
+            LimitRollover, and_(LimitRollover.user_id == CategoryLimit.user_id,
+                                LimitRollover.category == CategoryLimit.category)
+        ).where(CategoryLimit.user_id == owner.id, CategoryLimit.category == txn.category)
+    )).first()
+    if found is None or found[0].currency != txn.currency:
         return
+    rule, rollover_since = found
     # Plain values, as in post_save_check: a lost notification race rolls back and expires the row.
     category, currency = rule.category, rule.currency
     limits = {period: getattr(rule, f"{period}_limit") for period in PERIODS}
@@ -817,14 +996,18 @@ async def _check_category(db: AsyncSession, owner: User, txn: Transaction, windo
         if not start <= when < end:
             continue
         spent = await spent_between(db, owner, currency, start, end, category)
-        if spent < limit:
-            if _warns(spent, limit, warn_percent):  # in-app only, never emailed
-                await _notify_once(db, owner, period, start_date, end, limit, spent, currency, category,
+        effective = await _effective_limit(db, owner, currency, period, limit, rollover_since, windows, category)
+        if not _reached(spent, effective):
+            if _warns(spent, effective, warn_percent):  # in-app only, never emailed
+                await _notify_once(db, owner, period, start_date, end, effective, spent, currency, category,
+                                   dedupe_key=_warning_key(period, start_date, limit, warn_percent, category),
                                    warn_percent=warn_percent)
             continue
-        if await _notify_once(db, owner, period, start_date, end, limit, spent, currency, category) and mailer.configured():
+        created = await _notify_once(db, owner, period, start_date, end, effective, spent, currency, category,
+                                     dedupe_key=_notification_key(period, start_date, limit, category))
+        if created and mailer.configured():
             try:
-                subject, text, body = compose_alert(period, limit, spent, start_date, end, txn, currency, category)
+                subject, text, body = compose_alert(period, effective, spent, start_date, end, txn, currency, category)
                 await mailer.send_email(mailer.recipient(), subject, text, body)
             except Exception as error:  # noqa: BLE001 - the notification already went out
                 logger.warning("Category limit email failed: %s", error)

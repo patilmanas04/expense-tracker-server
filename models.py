@@ -18,6 +18,7 @@ from sqlalchemy import (
     case,
     select,
 )
+from sqlalchemy.dialects import mysql
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, column_property, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -978,5 +979,209 @@ Transaction.refund_for = column_property(
     select(RefundWatch.transaction_id)
     .where(RefundWatch.credit_id == Transaction.id)
     .correlate_except(RefundWatch)
+    .scalar_subquery()
+)
+
+
+# Lend & borrow (ledger.py). Each kind's sign in a person's balance: positive = they owe you.
+LEDGER_KINDS = {"lent": 1, "repaid_by_me": 1, "borrowed": -1, "repaid_to_me": -1}
+DEBIT_KINDS = frozenset({"lent", "repaid_by_me"})  # on a payment (or cash)
+CREDIT_KINDS = frozenset({"borrowed", "repaid_to_me"})  # on money received (or cash)
+
+
+class LedgerEntry(Base):
+    """Money between you and a person (ledger.py). Linked to a parsed INR transaction (`transaction_id`, its
+    share of that payment or credit; totals then count the transaction's amount minus its entries), or a cash
+    entry with its own `day`. Kinds and signs: lent +1, repaid_by_me +1 (a payment, or cash you gave);
+    borrowed −1, repaid_to_me −1 (money received, or cash you got). A person's balance is Σ sign × amount;
+    positive means they owe you. Rows are deleted explicitly with their transaction (main.delete_transaction);
+    the foreign key is only a backup."""
+
+    __tablename__ = "ledger_entries"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    person: Mapped[str] = mapped_column(
+        String(60),
+        nullable=False,
+    )  # as typed, spaces collapsed
+    person_key: Mapped[str] = mapped_column(
+        String(60),
+        nullable=False,
+    )  # ledger.person_key: groups "Rahul" and "rahul "
+    kind: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+    )  # a LEDGER_KINDS key
+    amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+    )  # more than zero
+    day: Mapped[Optional[date]] = mapped_column(
+        Date,
+        nullable=True,
+    )  # IST day, cash entries only; a linked entry uses its transaction's date
+    transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    note: Mapped[Optional[str]] = mapped_column(
+        String(200),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        # Microseconds on TiDB/MySQL too (a plain DATETIME there drops them): the entries of one PUT are a
+        # microsecond apart to keep the order they were sent in, and GET /ledger orders by it.
+        DateTime(timezone=True).with_variant(mysql.DATETIME(timezone=True, fsp=6), "mysql"),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_ledger_person", "user_id", "person_key"),
+    )
+
+
+
+class LimitRollover(Base):
+    """Rollover on a monthly limit (limits.py): while a row exists, the scope's monthly limit adds what you didn't
+    spend last month, or takes off what you overspent, clamped to ₹0 … twice the limit. `category` is "All" for the
+    overall limit, else the category limit's category. Carry starts with the first month that begins after
+    `enabled_at` (IST). Turning it off, removing the limit or its monthly amount deletes the row."""
+
+    __tablename__ = "limit_rollovers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )  # "All" = the overall limit
+    enabled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )  # turning it on again while on keeps the first
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "category", name="uq_limit_rollover"),
+    )
+
+
+class SavingsGoal(Base):
+    """Something you're saving toward (goals.py). Progress is worked out in the app: `manual_saved` plus every
+    parsed INR payment tagged #`tag` (its counted amount). One active goal per tag."""
+
+    __tablename__ = "savings_goals"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(
+        String(60),
+        nullable=False,
+    )
+    target: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+    )  # more than zero
+    target_month: Mapped[Optional[str]] = mapped_column(
+        String(7),
+        nullable=True,
+    )  # "YYYY-MM"; None = no target month
+    tag: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )  # normalised (goals.clean_tag), without "#"
+    manual_saved: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        default=0,
+        nullable=False,
+    )  # "Saved so far" added by hand, never below zero
+    archived: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class CustomCategory(Base):
+    """A category of your own (categories.py): a name next to the built-in list, with an icon and a colour the
+    app draws. `name_key` is the name case-folded: names are unique per user without case."""
+
+    __tablename__ = "custom_categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+    )  # as stored on transactions, rules and limits
+    name_key: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+    )
+    icon: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+    )  # categories.ICONS
+    colour: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+    )  # categories.COLOURS
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "name_key", name="uq_custom_category"),
+    )
+
+# Σ of the transaction's lend & borrow entries (0 when none); totals count amount − this. One sub-select per row on
+# an indexed key, like duplicate_of. Compare it as Decimal(str(...)): SQLite may hand back an int or a float.
+Transaction.linked_amount = column_property(
+    select(func.coalesce(func.sum(LedgerEntry.amount), 0))
+    .where(LedgerEntry.transaction_id == Transaction.id)
+    .correlate_except(LedgerEntry)
     .scalar_subquery()
 )

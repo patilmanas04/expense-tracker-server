@@ -86,6 +86,25 @@ Each SMS gets its name and category from, in order:
 
 When the regex parser can't read an SMS and Gemini parses all of it, the merged name and a matching rule's category still apply (a rule's category replaces Gemini's; `parsed_by` stays `ai_agent`); otherwise your category for the merchant does. An SMS nobody could read (Needs review) gets neither.
 
+### Your own categories
+
+`categories.py` adds categories of your own ("Pets", "Gym") next to the built-in list, in `custom_categories` (added by `create_all`; unique per user on the case-folded name, `uq_custom_category`). Up to 30.
+
+```http
+GET    /api/v1/categories                         -> {"built_in": [parser.CATEGORIES, Uncategorized included], "custom": [CustomCategoryOut, oldest first]}
+POST   /api/v1/categories   {"name": "Pets", "icon": "PawPrint", "colour": "orange"}  -> 201 CustomCategoryOut
+PUT    /api/v1/categories/{id}   {"icon": "Dumbbell", "colour": "teal"}              -> 200 CustomCategoryOut (the name never changes)
+DELETE /api/v1/categories/{id}?move_to=Shopping                                     -> 200 {"moved": 3}
+```
+
+`CustomCategoryOut` = `{"id", "name", "icon", "colour"}`. Icons: PawPrint, Dumbbell, Gift, Baby, House, Plane, Coffee, Shirt, Wrench, BookOpen, Tag, Sparkles; colours: violet, blue, green, orange, pink, amber, teal, red, slate, gray (the app's `CUSTOM_ICONS` / `PALETTE` in `lib/categories.ts`; `tests/test_custom_categories.py` compares them). Session on every route, `Origin` on writes.
+
+- **Names:** spaces collapsed, 1–40 characters of letters, digits, spaces and `& - ' . , ( ) /`, with at least one letter or digit (no ":", which notification keys use as a separator). 422 "Enter a name." / "Names can be up to 40 characters." / "Use letters, digits, spaces and & - ' . , ( ) /." / "Pick an icon from the list." / "Pick a colour from the list.".
+- **Reserved, in any case** (409 "A category with this name already exists."): every built-in (Uncategorized and Self Transfer included), "All" (the overall limit), "Other" (the app's Report bucket), and your existing names. 409 "You can have up to 30 categories." at 30.
+- **Using one:** a custom category counts like Transfer (debits as spending, credits as income). Adding or editing a transaction, category rules and spend limits (category and rollover, and a new merchant's category) accept it in any case and store its own spelling; one handler (`categories.canonical`) checks names against the built-ins plus yours. An unknown name is a 422 with a plain-text `detail`: "Unknown category." (transactions), "Pick a category from the list." (rules), "Pick a spending category, or All." (`PUT /limits`, `/limits/rollover`), "Pick a spending category." (`/limits/merchants`). Merchant memory remembers it, so the next SMS from that merchant gets it (`regex+user`). Category limits on your own categories are listed after the built-ins, by name.
+- **Not in Gemini:** the parser's keyword rules and Gemini prompts only know the built-ins, so a custom category reaches a payment only through you: an edit, memory, a rule.
+- **Delete with move:** its payments move to `move_to` (default Uncategorized; any built-in or another of yours, not itself, else 422 "Pick another category to move its payments to."), with `updated_at` moved so the app's poll sees them; its merchant memory moves too, or is forgotten for Uncategorized; its limit, rollover and rules are deleted. One commit. 404 "Category not found." for an id that isn't yours.
+
 `parsed_by` records where the category came from: `regex`, `regex+rule` (one of your category rules), `regex+user`, `regex+history`, `regex+ai`, `ai_agent`, `manual`, or `edited` (an SMS that needed review, completed by hand).
 
 ## What counts as spending
@@ -98,6 +117,8 @@ When the regex parser can't read an SMS and Gemini parses all of it, the merged 
 | `INVESTED` | Investments & Finance | Neither; the app shows its debits as **Invested**. Investment credits (redemptions) count as nothing. |
 
 Every other category counts, including Cash Withdrawal, Transfer, Uncategorized and no category: debits as spending, credits as income. Net flow is income − spending − invested. The app keeps a copy of both sets in `expense-tracker-client/lib/categories.ts`; `tests/test_spending.py` compares them (and the category order) when both repos sit side by side. Past months' figures change once when this ships, because card bills, self transfers and investments stop counting retroactively.
+
+**Payments minus lend & borrow entries.** A transaction counts its **counted amount**: its amount minus its linked lend & borrow entries (see Lend & borrow). Splitting a ₹1,800 dinner with two friends at ₹600 each counts ₹600 as spending; a ₹600 repayment from a friend isn't income, and a ₹1,000 credit of which ₹600 was a repayment counts ₹400. Every total, limit meter, alert and merchant limit uses it (`spending.linked_totals()` / `counted_amount()` in SQL; `linked_amount` on every transaction for the app's `t.counted`). The category doesn't change.
 
 ## Possible duplicates
 
@@ -430,6 +451,50 @@ POST   /api/v1/refunds/{transaction_id}/reject/{credit_id}   -> 204   (No)
 
 Tests: `tests/test_refunds.py` (marking and every error, suggestions and their edges, Yes / No, the buttons and their resolved texts, the reminder job, cleanup on delete, statement counts).
 
+## Lend & borrow
+
+`ledger.py` records splits and loans with people: who owes you, and whom you owe. Entries live in `ledger_entries` (added by `create_all`): `person` (as typed, spaces collapsed, up to 60 characters), `person_key` (spaces collapsed, case folded: "Rahul" and "rahul " are one person), `kind`, `amount` (more than zero), and either `transaction_id` (a share of a parsed INR transaction) or `day` (a cash entry, IST, today or earlier), plus an optional `note` (up to 200 characters).
+
+| Kind | On | Sign |
+| --- | --- | --- |
+| `lent` ("Lent to") | a payment, or cash | +1 |
+| `repaid_by_me` ("Repaid to") | a payment, or cash | +1 |
+| `borrowed` ("Borrowed from") | money received, or cash | −1 |
+| `repaid_to_me` ("Repayment from") | money received, or cash | −1 |
+
+A person's balance is Σ sign × amount: **positive means they owe you**, negative that you owe them. Overpaying turns it around. Linked entries lower the transaction's counted amount (see What counts as spending); every transaction carries `linked_amount` (0 when none).
+
+```http
+GET    /api/v1/ledger                                   -> {"people": [{"person": "Rahul", "key": "rahul", "balance": 1600.0, "entries": [EntryOut, newest first]}]}
+POST   /api/v1/ledger   {"person": "Rahul", "kind": "lent", "amount": "500", "day": "2026-11-18", "note": null}   -> 201 EntryOut (cash)
+DELETE /api/v1/ledger/{id}                              -> 204
+GET    /api/v1/transactions/{id}/ledger                 -> [EntryOut, oldest first]
+PUT    /api/v1/transactions/{id}/ledger   {"entries": [{"person": "Rahul", "kind": "lent", "amount": "600", "note": null}]}
+                                                        -> {"linked_amount": 1200.0, "updated_at": "…", "entries": [EntryOut]}
+```
+
+`EntryOut` = `{"id", "person", "kind", "amount", "day" (the cash day, or the transaction's IST date), "transaction_id" | null, "merchant" (the transaction's) | null, "note" | null}`. People are ordered by the size of their balance (ties by name), then settled people, the most recent first; `person` is the spelling of their newest entry. A new entry (POST, or PUT on a transaction) for a person you already have is saved in their existing spelling ("rahul " becomes "Rahul"), so typing another case never relabels their history; a person whose only entries a PUT replaces takes the new spelling. Session on every route, `Origin` on writes.
+
+- **PUT** replaces the transaction's entries (0–20; `[]` removes them all). Checked in this order (422): "Only payments Folio has read can have lend & borrow entries.", "Lend & borrow is in rupees only.", "On a payment, use Lent to or Repaid to." / "On money received, use Repayment from or Borrowed from.", "Shares add up to more than the payment." (equal is fine). Field errors: "Enter a name.", "Names can be up to 60 characters.", "Names can't contain invalid characters.", "Enter an amount above zero." (also for more than 2 decimals), "Notes can be up to 200 characters.", "Up to 20 entries per payment.", and for cash "The date can't be in the future.". It moves the transaction's `updated_at` (the app's poll sees the new `linked_amount`) and, on a payment, runs the spend-limit check again. The category isn't touched and nothing goes into merchant memory.
+- **DELETE** of a linked entry moves its transaction's `updated_at` in the same commit and, for a parsed payment, runs the limit check again (its counted amount rose). 404 "Entry not found.".
+- **Editing a transaction with entries** (`PATCH /api/v1/transactions/{id}`): changing its type is 409 "Remove its lend & borrow entries first."; an amount below the entries is 409 "The amount can't be less than the ₹1,200.00 in lend & borrow entries."; a category edit keeps them.
+- **Deleting a transaction** deletes its entries in the same commit (`ledger.release`); cash entries stay.
+
+Cost: `GET /ledger` is one query; the counted amount is one grouped outer join inside the queries that already sum spending, so `GET /api/v1/limits` keeps its round trips. Tests: `tests/test_ledger.py`.
+
+## Savings goals
+
+`goals.py` stores goals in `savings_goals` (added by `create_all`): a name (1–60 characters), a `target` (more than zero), an optional `target_month` ("YYYY-MM"), a `tag`, `manual_saved` ("Saved so far" added by hand, zero or more) and `archived`. Progress is worked out in the app: `manual_saved` plus the counted amount of every parsed INR payment tagged `#tag` in its note, so moving money to a savings account (category Self Transfer, not spending) and tagging it counts toward the goal.
+
+```http
+GET    /api/v1/goals          -> [Goal]: active ones oldest first, then archived ones
+POST   /api/v1/goals   {"name": "New phone", "target": "60000", "target_month": "2027-03", "tag": "#phone", "manual_saved": 0, "archived": false}  -> 201 Goal
+PUT    /api/v1/goals/{id}     (replaces every field; "Add money" sends the new manual_saved)  -> 200 Goal
+DELETE /api/v1/goals/{id}     -> 204
+```
+
+`Goal` = `{"id", "name", "target", "target_month" | null, "tag", "manual_saved", "archived", "created_at"}`. Tags follow the app's tag rule (`lib/tags.ts`): trimmed, one leading "#" dropped, NFC, lower case; 1–30 letters (any language, with their marks), digits, "_" and "-", with at least one letter. Only one **active** goal can use a tag: 409 "Another goal uses #phone." (archived goals keep theirs). 422: "Enter a name." / "Names can be up to 60 characters." / "Names can't contain invalid characters.", "Enter a target above zero.", "Pick a month like 2027-03.", "Saved so far can't be below zero.", "Enter a tag." / "Tags use letters, digits, _ and -." / "Tags can be up to 30 characters." / "A tag needs at least one letter.". 404 "Goal not found." for an id that isn't yours. Tests: `tests/test_goals.py`.
+
 ## Daily jobs and the SMS watchdog
 
 Every number in Folio depends on the iPhone Shortcut forwarding bank SMS. If it stops (an iOS update, a revoked permission, a changed Shortcut), Folio simply receives nothing. A daily check run by the server itself warns you.
@@ -511,7 +576,15 @@ PUT /api/v1/limits   {"weekly_limit": "5000", "monthly_limit": null}            
 PUT /api/v1/limits   {"category": "Food & Dining", "weekly_limit": "1500", "monthly_limit": null}
 ```
 
-Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start.
+Leaving both amounts null for a category removes its limit. Category limits live in the `category_limits` table, which `create_all` adds on the next server start. Your own categories (see Categories) can have limits too.
+
+**Rollover:** a monthly limit, overall or a category's, can roll over. Its limit then adds what you didn't spend of last month's limit, or takes off what you overspent, between ₹0 and twice the limit: `limit = base + max(−base, min(base, base − last month's spending))`. ₹5,000 with ₹4,200 spent last month gives ₹5,800; ₹6,500 spent gives ₹3,500; ₹12,000 gives ₹0. "Last month" is the previous calendar month, or the previous pay period with 'Month starts on payday' on (no carry when there is none). Carry starts with the first month that begins after the IST day you turned it on (`enabled_at`); until then the limit is the base. Weekly and merchant limits never roll over.
+
+```http
+PUT /api/v1/limits/rollover   {"category": "Food & Dining", "enabled": true}   ("All" or null for the overall limit)  -> the full summary
+```
+
+422 "Set a monthly limit first." when turning it on without a monthly amount; 422 "Pick a spending category, or All." for a category that can't have a limit. Turning it on again keeps the first `enabled_at`; turning it off always succeeds. Removing a category limit, or saving any limit without a monthly amount, turns its rollover off. Rows live in `limit_rollovers` (unique per user and scope, `uq_limit_rollover`). In `GET /api/v1/limits`, a monthly meter where carry applies shows the rollover limit as `limit` (it can be `0.0`), with `base` (the limit as set) and `carried` (`limit − base`; both `null` elsewhere), and `rollover` is true on the summary (overall) or the category while it's on. Alerts compare spending with the rollover limit and their texts show it, but their dedupe keys and `spend_alerts.limit_amount` use the base, so a late SMS for last month that changes the carry never sends the same alert twice. A ₹0 rollover limit alerts on the first payment ("100%"). Cost: last month's spending joins the summary's one query; an alert check adds one query only when carry applies. Tests: `tests/test_rollover.py`.
 
 **Per merchant:** a limit on one merchant name, such as Swiggy, with the same weekly/monthly periods, meter and one-time notification ("Monthly Swiggy limit crossed"). It counts every parsed INR debit (yours, plus SMS from the Shortcut) whose category counts as spending and whose merchant name contains the limit's name as the **same whole words with the same case**; anything that isn't a letter, digit or combining mark (such as the vowel signs in "स्विगी") separates words. Names are compared in Unicode NFC, so "Café" typed with a separate accent is the same name. Matching lives in `merchants.py` and runs in Python, so no database collation changes the answer. A "Swiggy" limit counts "Swiggy" and "Swiggy Ltd", but not:
 
