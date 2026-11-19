@@ -983,6 +983,58 @@ Transaction.refund_for = column_property(
 )
 
 
+class TransferPair(Base):
+    """A suggested transfer between two of your own accounts (transfers.py): a bank-account debit and a same-amount
+    credit into a different account within 30 minutes. pending until you Confirm (both become Self Transfer) or
+    reject; expired when Confirm's re-check fails. Unique on (debit, credit), so a rejected pair is never suggested
+    again. Rows are deleted explicitly with either transaction (main.delete_transaction); the foreign keys are only
+    a backup."""
+
+    __tablename__ = "transfer_pairs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )  # set in code before insert, so the notification's dedupe_key "pair:<id>" is built first
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    debit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )  # always the DEBIT leg
+    credit_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )  # always the CREDIT leg
+    status: Mapped[str] = mapped_column(
+        String(10),
+        default="pending",
+        nullable=False,
+    )  # "pending", "confirmed", "rejected" or "expired"
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    decided_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )  # set on confirm, reject or expire
+
+    __table_args__ = (
+        UniqueConstraint("debit_id", "credit_id", name="uq_transfer_pair"),
+    )
+
+
 # Lend & borrow (ledger.py). Each kind's sign in a person's balance: positive = they owe you.
 LEDGER_KINDS = {"lent": 1, "repaid_by_me": 1, "borrowed": -1, "repaid_to_me": -1}
 DEBIT_KINDS = frozenset({"lent", "repaid_by_me"})  # on a payment (or cash)

@@ -35,6 +35,7 @@ import refunds
 import rules
 import safe_to_spend
 import settings_store
+import transfers
 import upcoming
 import watchdog
 from parser import (UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
@@ -52,6 +53,8 @@ post_save.register("payment_alerts", payment_alerts.check, {"sms", "manual", "ai
 post_save.register("low_balance", low_balance.check, {"sms", "manual", "restored"})
 post_save.register("recurring", recurring.check_after_save, {"sms", "manual", "edit", "ai_retry", "restored"})
 post_save.register("refunds", refunds.suggest, {"sms", "manual", "restored"})
+# Self-transfer suggestions (count_real_spending.md Phase 3); delete this line to turn pairing off.
+post_save.register("transfers", transfers.check, {"sms"})
 
 # Daily jobs (jobs.py), run once a day at 21:00 IST in this order. Later designs add their line here.
 jobs.register("watchdog", watchdog.daily)
@@ -113,6 +116,7 @@ app.include_router(recurring.router)
 app.include_router(upcoming.router)
 app.include_router(safe_to_spend.router)
 app.include_router(refunds.router)
+app.include_router(transfers.router)
 app.include_router(goals.router)
 app.include_router(categories.router)
 
@@ -628,13 +632,14 @@ async def delete_transaction(
     """Deletes an SMS or a hand-added entry for good. If the Shortcut sends the same SMS again,
     it's recorded again. Deleting the earlier of two possible duplicates makes the other count again; a
     payment's refund watch goes with it, and deleting a confirmed refund makes its payment's watch open again. Its
-    lend & borrow entries go with it (cash entries stay)."""
+    lend & borrow entries go with it (cash entries stay), and any self-transfer suggestion it is part of."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
     released = await duplicates.release(db, txn.id)  # same commit as the delete
     await refunds.release(db, txn.id)  # same commit as the delete
     await ledger.release(db, txn.id)  # same commit as the delete
+    await transfers.release(db, txn.id)  # same commit as the delete
     await db.delete(txn)
     await db.commit()
     for released_id in released:  # they count again: the after-save checks run

@@ -80,7 +80,7 @@ Each SMS gets its name and category from, in order:
 
 **Card bills.** A debit SMS that names a credit card and a bank account ("Rs.3000.00 debited from HDFC Bank A/c XX4821 … towards HDFC Bank Credit Card XX9012") is a card bill paid from the bank: **Credit Card Payment**. The check (`parser.is_card_bill_debit`, the same one the bank balance uses) runs on the whole SMS before the merchant keywords, so a bill "towards Amazon Pay ICICI Credit Card" isn't Shopping, and again after a Gemini full parse, whatever Gemini guessed. Card swipes never name a bank account and keep their merchant's category. The card's own "payment received" SMS is also Credit Card Payment; that rule is for credits only, because a debit saying "payment … card" can be a card autopay for a purchase.
 
-**Self Transfer** is money moved between your own accounts. Nothing assigns it automatically except Gemini when the SMS itself says so ("to self", "own account"); you pick it by editing a transaction. **Transfer** is still a payment to or from another person.
+**Self Transfer** is money moved between your own accounts. Gemini sets it when the SMS itself says so ("to self", "own account"), and Folio **suggests** it for a likely transfer between your own accounts (see Self-transfer suggestions); a suggestion sets it only when you tap **Confirm**. You can also pick it by editing a transaction. **Transfer** is still a payment to or from another person.
 
 **Salary** is only monthly pay ("salary", "sal", "payroll" in a credit SMS); other money in (interest, dividends, anything else) is **Income**. The dashboard counts salary paid on the 16th or later toward the next month, unless 'Month starts on payday' is on, when months start on salary day (see Pay periods). A debit that mentions interest is never income.
 
@@ -308,6 +308,7 @@ One background task, `post_save.run(transaction_id, cause)`, runs every check th
 | `low_balance` (Balance left dropped below your level) | `sms`, `manual`, `restored` (only "Not a duplicate"; a row released by deleting its original doesn't alert) |
 | `recurring` (a new recurring payment, or its price changed) | all five (only the newest payment of a series notifies, so an edit to an older one or a late SMS doesn't) |
 | `refunds` (is this credit the refund you're expecting? See Refund watch) | `sms`, `manual`, `restored` (a held-out credit is suggested once you mark it "Not a duplicate") |
+| `transfers` (a likely transfer between your own accounts? See Self-transfer suggestions) | `sms` only (new SMS; hand-added rows, edits and restored rows never pair) |
 
 A possible duplicate waiting for your decision counts nowhere, so it gets no checks until it's restored; other users' rows are skipped too. Merges and rule applies (Names and rules) still run the limit check alone (`limits.check_spend_limits`).
 
@@ -451,6 +452,41 @@ POST   /api/v1/refunds/{transaction_id}/reject/{credit_id}   -> 204   (No)
 
 Tests: `tests/test_refunds.py` (marking and every error, suggestions and their edges, Yes / No, the buttons and their resolved texts, the reminder job, cleanup on delete, statement counts).
 
+## Self-transfer suggestions
+
+`transfers.py` spots money you moved between two of your own accounts (ICICI → HDFC, or one HDFC account to another) and asks "Looks like a transfer between your accounts" with **Confirm** / **Not a self transfer**. Nothing changes until you tap Confirm: both legs keep counting as spending and income until then.
+
+**Which SMS can pair.** Both legs are parsed INR SMS, more than zero, not added by hand or completed by hand (`parsed_by` not `manual` or `edited`), whose text changes a bank balance **and names a bank account** ("A/c", "A/C", "Acct", "Acc", "Account", outside card wording), so debit-card alerts ("Spent Rs.… From HDFC Bank Card x5566") never pair: their account number is the card's. Each has an account number (`account_ref`) that isn't Cash. Neither category is Credit Card Payment, **Cash Withdrawal** (an ATM withdrawal is never a transfer to another of your accounts) or Investments & Finance. Not both are already Self Transfer (one may be). Neither is a possible duplicate waiting for your decision, and neither is already in a pending or confirmed pair. Only newly saved SMS are checked (post-save check `transfers`, cause `sms`), plus the re-check after Not a self transfer; past transactions are never paired.
+
+**What a match is.** The opposite type, the same amount, a **different** account number, and a time within **30 minutes either way, inclusive**. The second leg to arrive finds the first. The closest in time wins; a tie gives no suggestion. A pair that was rejected or expired is never suggested again.
+
+Pairs live in `transfer_pairs` (added by `create_all`; no column is added to an existing table): `id`, `user_id` (the owner, FK `users`, cascade), `debit_id` and `credit_id` (always the DEBIT and the CREDIT leg, FK `transactions`, cascade; unique together, `uq_transfer_pair`), `status` (`pending`, `confirmed`, `rejected` or `expired`), `created_at`, `decided_at`. The pair and its notification are written in one commit; if both legs' checks find each other at the same moment, the unique key keeps one.
+
+**The notification:** `kind = "self_transfer"`, "Looks like a transfer between your accounts" / "₹10,000.00 from ICICI XX310 at 10:02 to HDFC XX4821 at 10:04" (each leg's account and IST time), link `null`, dedupe key `pair:{pair id}`. While pending it has **Confirm** → `POST /api/v1/transfers/pairs/{id}/confirm` and **Not a self transfer** → `POST /api/v1/transfers/pairs/{id}/reject`; once decided, "Marked as self transfer", "Not a self transfer" or "No longer applies" (expired, or the pair is gone). One statement per inbox read.
+
+```http
+POST /api/v1/transfers/pairs/{pair_id}/confirm   -> 200 TransferPairOut (status "confirmed")
+POST /api/v1/transfers/pairs/{pair_id}/reject    -> 200 TransferPairOut (status "rejected")
+```
+
+`TransferPairOut` = `{"id": "<uuid>", "status": "pending" | "confirmed" | "rejected" | "expired", "debit_id": "<uuid>", "credit_id": "<uuid>", "decided_at": "<UTC time>" | null}`. Both need the owner session (401) and the app's `Origin` (403 "Invalid request origin."); a malformed id is FastAPI's 422.
+
+- **Both:** 404 "Suggestion not found." (unknown, or another user's) · 409 "This suggestion was already answered." (not pending, including a double tap).
+- **Confirm** re-checks both legs first: each still exists and is yours, both are parsed, the debit is a DEBIT and the credit a CREDIT of the same amount and currency, neither category is Credit Card Payment, Cash Withdrawal or Investments & Finance, and neither leg is in another confirmed pair. If that fails the pair becomes `expired` and you get 409 "This suggestion no longer applies.". Otherwise one commit marks the pair `confirmed` and sets both legs to Self Transfer with `updated_at` bumped, so the app's poll picks them up and both stop counting. Confirm writes **no** merchant memory.
+- **Not a self transfer** marks the pair `rejected`; both legs are unchanged and keep counting. Each leg is then checked again in the background, so a real partner that lost to a coincidence can still be suggested.
+
+Dismissing the notification (swipe or Clear) only hides it: the pair stays pending and both legs keep counting. **Deleting either leg** (`DELETE /api/v1/transactions/{id}`, same commit) deletes its pairs in any status; the other leg keeps its category.
+
+**Limits (accepted):** a limit alert for the debit leg may already have gone out before you confirm. Past transactions are never paired, and there is no matching on the UPI reference / UTR.
+
+**Status:** pairing is live but not yet checked against a real HDFC/ICICI pair: `REAL_PAIRS` in `tests/test_transfers.py` is empty, so `test_real_pairs_pair` is skipped (the skip reason shows in every test run). To close that gap, find one past transfer between your own HDFC and ICICI accounts in Activity, copy its two SMS, mask the account numbers, names and references, and add them to `REAL_PAIRS`. If the test fails, the parser reads that wording differently: fix the parser, not the pairing rules. If both legs share a UTR, reopen Alternative F (reference matching, count_real_spending.md).
+
+**Turning it off:** delete the `post_save.register("transfers", …)` line in `main.py`. There is no setting: every suggestion needs your Confirm, and Not a self transfer handles a noisy one.
+
+**Cost:** 0 statements for an SMS that can't pair, 1 query otherwise, plus create_once's check and one commit when it suggests. The resolver is 1 statement per inbox read; Confirm at most 5 statements and one commit.
+
+Tests: `tests/test_transfers.py` (every pairing rule from raw SMS, both stricter rules, the window edges, closest and tie, races, Confirm / Not a self transfer and every error, the buttons and their resolved texts, cleanup on delete, statement counts, and the skipped real-pair gate).
+
 ## Lend & borrow
 
 `ledger.py` records splits and loans with people: who owes you, and whom you owe. Entries live in `ledger_entries` (added by `create_all`): `person` (as typed, spaces collapsed, up to 60 characters), `person_key` (spaces collapsed, case folded: "Rahul" and "rahul " are one person), `kind`, `amount` (more than zero), and either `transaction_id` (a share of a parsed INR transaction) or `day` (a cash entry, IST, today or earlier), plus an optional `note` (up to 200 characters).
@@ -563,7 +599,7 @@ Set a weekly (Mon–Sun, IST) and/or monthly limit in **Settings → Spending li
 
 **Warning before a limit is reached:** once spending on a limit is at or above the warning level (`limits.warn_percent` in Settings; 80% by default, Off with `null`) and still under the limit (level ≤ spent < limit, compared exactly, so ₹4,000.00 of ₹5,000 warns at 80%), Folio creates one in-app notification, `kind = "spend_warning"`: "80% of your monthly Food & Dining limit used", "80% of your weekly spend limit used" (overall) or "80% of your monthly Swiggy limit used" (a merchant name over 120 characters is cut with "…"). The body is the same as the reached alert's ("₹4,150.00 of ₹5,000.00 on Food & Dining this month (Thu 1 Oct – Sat 31 Oct) · 83%"; " at Swiggy" for a merchant, nothing for overall) and it links to `/settings/limits`. It goes out once per limit, period, limit amount and level, by its dedupe key: `spend_warn:{period}:{start}:{limit}:{level}` overall, `spend_warn:{category}:{period}:{start}:{limit}:{level}` for a category, `spend_warn:merchant:{limit_id}:{period}:{start}:{limit}:{level}` for a merchant (for example `spend_warn:Food & Dining:monthly:2026-10-01:5000.00:80`); so changing the limit or the level allows one more. Warnings are never emailed. A payment that jumps straight past the limit gives only the reached alert ("… limit crossed"), no warning. The rule depends only on the current total, so every check gives the same answer: an edit that brings spending down from over the limit back into the band warns once; a late SMS for a past week or month never warns (only the payment's own current period is checked, as for reached alerts); and `check_spend_limits` (merges and rule applies) warns too. The same guards apply as for reached alerts: the overall limit only for payments in its currency, a category limit only for the payment's own category, merchant limits only where the name matches. `GET /api/v1/limits` is unchanged: a meter's `alerted` means the reached alert only.
 
-**Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts; Refund watch's `refund_match` suggestions are the first kind with buttons. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
+**Buttons on notifications:** every item in `GET /api/v1/notifications` has `actions` (`[{label, path}]`, each a same-origin `POST` under `/api/v1/` with no body) and `resolved` (text shown in place of the buttons once decided). Both are empty for spend-limit alerts; Refund watch's `refund_match` and Self-transfer suggestions' `self_transfer` notifications have buttons. A feature adds buttons to its own kind with `notifications.register_actions(kind, resolver)`: the inbox calls the resolver once per request with that kind's listed notifications and gets back buttons or resolved text per id. A resolver that fails is logged and its notifications just show no buttons. Kinds with buttons have `link: null`.
 
 **Clearing notifications:** `DELETE /api/v1/notifications/{id}` (swipe to delete) and `DELETE /api/v1/notifications` (Clear) hide notifications instead of deleting them (`notification_dismissals`, added by `create_all`). Each notification is also the record that its alert went out, so a cleared limit alert isn't sent again on the next payment, and the meter in Settings still says "notified".
 
@@ -711,4 +747,4 @@ uv run python -m unittest discover -s tests -v
 uv run python check_database.py
 ```
 
-Tests use an isolated in-memory SQLite database. `check_database.py` makes a read-only count query against your configured database. Provider responses are mocked in OAuth tests; real Google login requires your credentials.
+Tests use an isolated in-memory SQLite database. Exactly one test is skipped: `test_real_pairs_pair` in `tests/test_transfers.py`, until a real HDFC/ICICI self-transfer pair is added (see Self-transfer suggestions). `check_database.py` makes a read-only count query against your configured database. Provider responses are mocked in OAuth tests; real Google login requires your credentials.
