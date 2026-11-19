@@ -26,7 +26,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
-from sqlalchemy import delete, select, update
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +40,7 @@ from parser import CATEGORIES, UNCATEGORIZED
 router = APIRouter(prefix="/api/v1/categories", tags=["Categories"])
 
 MAX_CUSTOM = 30
+RULE_SET, PICKED = "regex+rule", "regex+user"  # parsed_by: a category rule set the category / you picked it
 MAX_NAME = 40  # String(40)
 # Matches CUSTOM_ICONS and PALETTE in expense-tracker-client/lib/categories.ts; tests compare them.
 ICONS = ("PawPrint", "Dumbbell", "Gift", "Baby", "House", "Plane", "Coffee", "Shirt", "Wrench", "BookOpen", "Tag",
@@ -214,9 +215,12 @@ async def delete_category(category_id: uuid.UUID,
     if target is None or _key(target) == _key(name):
         raise HTTPException(422, "Pick another category to move its payments to.")
     now = utc_now()
+    # Its rules go below, so a payment one of them set is now where you moved it ("regex+rule" becomes
+    # "regex+user", as on an edit): the sheet stops pointing at a rule that no longer exists.
+    picked = case((Transaction.parsed_by == RULE_SET, PICKED), else_=Transaction.parsed_by)
     moved = await db.execute(
         update(Transaction).where(ownership(user), Transaction.category == name)
-        .values(category=target, updated_at=now).execution_options(synchronize_session=False))
+        .values(category=target, parsed_by=picked, updated_at=now).execution_options(synchronize_session=False))
     memory = (MerchantCategory.user_id == user_id, MerchantCategory.category == name)
     if target == UNCATEGORIZED:
         await db.execute(delete(MerchantCategory).where(*memory))  # Uncategorized means "forget it"

@@ -417,6 +417,10 @@ class RuleSaved(BaseModel):
     changed: int  # past payments changed; 0 unless apply_to_past
 
 
+class RuleMatch(BaseModel):
+    rule: Optional[CategoryRuleOut]  # the first of your rules that matches the payment, or null
+
+
 class RuleExample(BaseModel):
     id: uuid.UUID
     merchant: Optional[str]
@@ -504,6 +508,25 @@ async def list_rules(user: User = Depends(current_user), db: AsyncSession = Depe
     """Your category rules, newest first: the order they're tried in."""
     return list(await db.scalars(select(CategoryRule).where(CategoryRule.user_id == user.id)
                                  .order_by(CategoryRule.created_at.desc(), CategoryRule.id.desc())))
+
+
+@rules_router.get("/match/{transaction_id}", response_model=RuleMatch)
+async def match_rule(transaction_id: uuid.UUID, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    """The rule that decides this payment's category for later SMS like it: the first of your rules (newest first)
+    that matches its name, SMS, amount and direction, or null. A rule runs before the category you pick, so the
+    edit sheet says a hand-picked category changes this payment only. SMS words never match a payment added by
+    hand. 404 when the payment isn't yours. Writes nothing."""
+    row = (await db.execute(select(
+        Transaction.merchant, Transaction.raw_message, Transaction.parsed_by, Transaction.amount,
+        Transaction.currency, Transaction.type,
+    ).where(Transaction.id == transaction_id, ownership(user)))).first()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
+    sms_text = None if row.parsed_by == HAND_SET[0] else row.raw_message  # added by hand ("manual"): no SMS
+    stored = {rule.id: rule for rule in await db.scalars(select(CategoryRule).where(CategoryRule.user_id == user.id))}
+    match = first_match(order(view_of(rule) for rule in stored.values()), row.merchant, sms_text, row.amount,
+                        row.currency, row.type)
+    return RuleMatch(rule=None if match is None else CategoryRuleOut.model_validate(stored[match.id]))
 
 
 @rules_router.post("/preview", response_model=RulePreviewOut, dependencies=[Depends(same_origin)])

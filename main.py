@@ -436,6 +436,7 @@ async def list_transactions(
 
 MANUAL = "manual"  # parsed_by for transactions added by hand
 EDITED = "edited"  # parsed_by for an SMS that needed review, completed by hand
+RULE_SET = categories.RULE_SET  # parsed_by for an SMS one of your category rules categorised (rules.py)
 MAX_TRANSACTION_AMOUNT = Decimal("9999999999.99")  # Numeric(12, 2)
 MAX_NOTE_LENGTH = 500
 
@@ -588,8 +589,9 @@ async def edit_transaction(
     db: AsyncSession = Depends(get_db),
 ):
     """Change any detail of an SMS or a hand-added entry, or add your own note ("" removes it).
-    A new category is remembered for the merchant, so later SMS from it get the same one. Giving
-    an SMS that needed review an amount makes it count."""
+    A new category is remembered for the merchant, so later SMS from it get the same one (on a payment a
+    category rule set, parsed_by becomes "regex+user": you picked it, not the rule). Giving an SMS that
+    needed review an amount makes it count."""
     txn = await db.scalar(select(Transaction).where(Transaction.id == transaction_id, ownership(user)))
     if txn is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Transaction not found.")
@@ -615,6 +617,8 @@ async def edit_transaction(
         changes["notes"] = changes["notes"] or None
     if "category" in changes:
         changes["category"] = await _known_category(db, user, changes["category"])
+        if txn.parsed_by == RULE_SET and changes["category"] != txn.category:
+            txn.parsed_by = categories.PICKED  # you picked it now, not the rule: the sheet stops saying a rule set it
     for field, value in changes.items():
         setattr(txn, field, value)
     if not txn.is_parsed and txn.amount > 0:

@@ -330,6 +330,22 @@ class CustomCategoryTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.delete(f"/api/v1/categories/{pets['id']}", headers=ORIGIN)
         self.assertEqual((response.status_code, self.detail(response)), (404, "Category not found."))
 
+    async def test_delete_ends_set_by_rule_on_moved_payments(self):
+        pets = (await self.create()).json()
+        response = await self.client.post("/api/v1/rules", headers=ORIGIN, json={"merchant_words": "Paws", "category": "Pets"})
+        self.assertEqual(response.status_code, 201, response.text)
+        by_rule = await self.sms("250.00")
+        self.assertEqual((by_rule["category"], by_rule["parsed_by"]), ("Pets", "regex+rule"))
+        other = await self.sms("80.00", merchant="Kirana Store")
+        response = await self.client.delete(f"/api/v1/categories/{pets['id']}", params={"move_to": "shopping"},
+                                            headers=ORIGIN)
+        self.assertEqual((response.status_code, response.json()), (200, {"moved": 1}))
+        self.assertEqual(await self.rows(CategoryRule), [])
+        rows = {str(t.id): t for t in await self.rows(Transaction)}
+        # Its rule is gone, so the moved payment no longer says a rule set it; others keep their parsed_by.
+        self.assertEqual((rows[by_rule["id"]].category, rows[by_rule["id"]].parsed_by), ("Shopping", "regex+user"))
+        self.assertEqual(rows[other["id"]].parsed_by, other["parsed_by"])
+
     async def test_delete_to_uncategorized_forgets_the_merchant(self):
         gym = (await self.create("Gym", "Dumbbell", "teal")).json()
         await self.create("Sport")

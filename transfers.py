@@ -51,7 +51,7 @@ from typing import Literal, NamedTuple, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import case, delete, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import post_save
@@ -75,6 +75,7 @@ ACTIVE = (PENDING, CONFIRMED)  # a leg in one of these is never offered again
 SELF_TRANSFER = "Self Transfer"
 NOT_PAIRABLE = frozenset({"Credit Card Payment", "Cash Withdrawal"}) | INVESTED
 HAND_ENTERED = ("manual", "edited")  # main.MANUAL / main.EDITED (not imported: this module never imports main)
+RULE_SET, PICKED = "regex+rule", "regex+user"  # parsed_by: a category rule set the category / you picked it
 TITLE = "Looks like a transfer between your accounts"
 NOT_FOUND = "Suggestion not found."
 ANSWERED = "This suggestion was already answered."
@@ -314,6 +315,11 @@ async def _still_applies(db: AsyncSession, user: User, pair_id: uuid.UUID, debit
     return other is None
 
 
+def _picked_by_you():
+    """parsed_by for a row whose category you just set: a rule's "regex+rule" becomes "regex+user"; others keep theirs."""
+    return case((Transaction.parsed_by == RULE_SET, PICKED), else_=Transaction.parsed_by)
+
+
 def _decide(pair_id: uuid.UUID, new_status: str, now: dt.datetime):
     """Moves a pair on, only while it is still pending: a decision that landed first wins."""
     return (update(TransferPair).where(TransferPair.id == pair_id, TransferPair.status == PENDING)
@@ -338,8 +344,10 @@ async def confirm(pair_id: uuid.UUID, user: User = Depends(current_user), db: As
         await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, ANSWERED)
     # No merchant memory: a transfer between your own accounts says nothing about the next payment to that name.
+    # A leg a category rule set is now your choice, not the rule's ("regex+rule" becomes "regex+user", as on an edit).
     await db.execute(update(Transaction).where(Transaction.id.in_([debit_id, credit_id]))
-                     .values(category=SELF_TRANSFER, updated_at=now).execution_options(synchronize_session=False))
+                     .values(category=SELF_TRANSFER, parsed_by=_picked_by_you(), updated_at=now)
+                     .execution_options(synchronize_session=False))
     await db.commit()
     return TransferPairOut(id=pair_id, status=CONFIRMED, debit_id=debit_id, credit_id=credit_id, decided_at=now)
 

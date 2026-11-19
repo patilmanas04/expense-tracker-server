@@ -450,6 +450,10 @@ class RouteTests(TransferTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         debit_id, credit_id, pair = await self.cuj2()
         self.assertEqual(await self.spent(), 10000)
+        async with AsyncSessionLocal() as db:  # a category rule set the debit's category
+            await db.execute(update(Transaction).where(Transaction.id == debit_id).values(parsed_by="regex+rule"))
+            await db.commit()
+        credit_parsed_by = (await self.row(credit_id)).parsed_by
         old = {txn_id: (await self.row(txn_id)).updated_at for txn_id in (debit_id, credit_id)}
         before = datetime.now(timezone.utc)
         response = await self.confirm(pair.id)
@@ -464,6 +468,9 @@ class RouteTests(TransferTestCase):
             row = await self.row(txn_id)
             self.assertEqual(row.category, "Self Transfer")
             self.assertGreater(row.updated_at, old[txn_id])
+        # You confirmed it, not the rule: the sheet stops saying a rule set it. Other legs keep their parsed_by.
+        self.assertEqual((await self.row(debit_id)).parsed_by, "regex+user")
+        self.assertEqual((await self.row(credit_id)).parsed_by, credit_parsed_by)
         polled = (await self.client.get("/api/v1/transactions", params={"updated_after": before.isoformat()})).json()
         self.assertEqual({row["id"] for row in polled}, {str(debit_id), str(credit_id)})
         self.assertEqual(await self.spent(), 0)

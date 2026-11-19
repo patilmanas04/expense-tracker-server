@@ -498,6 +498,58 @@ class SmsTests(DbTestCase):
         # Not matched, and the rule's category doesn't reach it through earlier payments either.
         self.assertEqual((small["merchant"], small["category"], small["parsed_by"]), ("Rahul", "Uncategorized", "regex"))
 
+    async def test_picking_another_category_by_hand_ends_set_by_rule(self):
+        await self.add_rule(merchant_words="swiggy", category="Entertainment")
+        txn = await self.sms(upi_debit("47.00", "Swiggy"))
+        self.assertEqual(txn["parsed_by"], "regex+rule")
+        # Editing anything else, or sending the same category, leaves the rule's marker.
+        response = await self.edit(txn["id"], notes="team lunch", category="Entertainment")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((response.json()["category"], response.json()["parsed_by"]), ("Entertainment", "regex+rule"))
+        # Picking another category: the sheet no longer says a rule set it ("Rules + your category").
+        response = await self.edit(txn["id"], category="Groceries")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((response.json()["category"], response.json()["parsed_by"]), ("Groceries", "regex+user"))
+        self.assertEqual((await self.row(txn["id"])).parsed_by, "regex+user")
+        # A hand-added payment keeps "manual" when its category changes.
+        manual = await self.manual("Swiggy", 48)
+        response = await self.edit(manual["id"], category="Shopping")
+        self.assertEqual((response.json()["category"], response.json()["parsed_by"]), ("Shopping", "manual"))
+
+    async def match(self, transaction_id, expect=200):
+        response = await self.client.get(f"/api/v1/rules/match/{transaction_id}")
+        self.assertEqual(response.status_code, expect, response.text)
+        return response.json()
+
+    async def test_the_rule_that_decides_a_payment_still_matches_after_a_hand_pick(self):
+        rule = await self.add_rule(merchant_words="swiggy", category="Entertainment")
+        await self.add_rule(sms_words="XX9999", category="Shopping")  # newer, but matches no SMS here
+        txn = await self.sms(upi_debit("47.00", "Swiggy"))
+        self.assertEqual((await self.match(txn["id"]))["rule"], rule["rule"])
+        # Picked by hand twice: parsed_by is "regex+user", but the rule still decides the next SMS, so the edit
+        # sheet keeps saying "Future payments like this follow your category rule".
+        for category in ("Groceries", "Shopping"):
+            response = await self.edit(txn["id"], category=category)
+            self.assertEqual((response.json()["category"], response.json()["parsed_by"]), (category, "regex+user"))
+            self.assertEqual((await self.match(txn["id"]))["rule"]["id"], rule["rule"]["id"])
+        later = await self.sms(upi_debit("48.00", "Swiggy"))
+        self.assertEqual((later["category"], later["parsed_by"]), ("Entertainment", "regex+rule"))
+        # No rule matches: null. SMS words never match a payment added by hand.
+        other = await self.sms(upi_debit("49.00", "Zomato"))
+        self.assertEqual(await self.match(other["id"]), {"rule": None})
+        hand = await self.manual("Zomato", 50)
+        await self.add_rule(sms_words="zomato", category="Shopping")
+        self.assertEqual((await self.match(other["id"]))["rule"]["category"], "Shopping")
+        self.assertEqual(await self.match(hand["id"]), {"rule": None})
+        # Only your own rules are tried; someone else's payment, or none, is a 404.
+        self.sign_in(self.other)
+        self.assertEqual(await self.match(txn["id"]), {"rule": None})
+        response = await self.client.get(f"/api/v1/rules/match/{hand['id']}")
+        self.assertEqual((response.status_code, response.json()["detail"]), (404, "Transaction not found."))
+        self.sign_in()
+        response = await self.client.get(f"/api/v1/rules/match/{uuid.uuid4()}")
+        self.assertEqual(response.status_code, 404, response.text)
+
     async def test_only_sms_rows_the_regex_parser_read_keep_a_rule_out_of_history(self):
         # Documented limit (README Categories step 3): a rule's category on a hand-added or Gemini-read row has
         # no marker (parsed_by stays "manual" / "ai_agent"), so it reaches later payments like any category.
