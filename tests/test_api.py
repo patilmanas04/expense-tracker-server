@@ -18,8 +18,9 @@ from unittest.mock import AsyncMock, patch
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from database import Base, engine, AsyncSessionLocal
-from models import Transaction, User
+from models import Transaction, UpcomingPayment, User
 from main import app
+import notices
 from auth import current_user
 from authlib.integrations.base_client import OAuthError
 from sqlalchemy.exc import IntegrityError
@@ -162,14 +163,16 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         autopay_notice = "AutoPay for NETFLIX, debit of Rs 649.00 is scheduled on 12-Dec-26. Mandate ID HDFC0000XYZ. -HDFC Bank"
         card_statement = "Statement for ICICI Bank Credit Card XX7001 generated. Total due Rs 4,500.00 Min due Rs 500.00 due by 05-Dec-26"
         headers = {"X-Webhook-Secret": "test-webhook-secret"}
-        for message in [autopay_notice, card_statement]:
-            response = await self.client.post("/api/v1/webhook/sms", json={"message": message}, headers=headers)
-            self.assertEqual(response.status_code, 200, response.text)
-            body = response.json()
-            self.assertEqual((body["status"], body["message"], body["transaction"]),
-                             ("ignored", "Message is not a completed transaction.", None))
+        with patch.object(notices, "STORE_NOTICES", False):  # pinned off: storing is tested in test_notices.py
+            for message in [autopay_notice, card_statement]:
+                response = await self.client.post("/api/v1/webhook/sms", json={"message": message}, headers=headers)
+                self.assertEqual(response.status_code, 200, response.text)
+                body = response.json()
+                self.assertEqual((body["status"], body["message"], body["transaction"]),
+                                 ("ignored", "Message is not a completed transaction.", None))
         async with AsyncSessionLocal() as db:
             self.assertIsNone(await db.scalar(select(Transaction)))
+            self.assertIsNone(await db.scalar(select(UpcomingPayment)))
         debit = "Rs 649.00 debited via UPI AutoPay from A/c XX1234 to NETFLIX. Ref 629400000649"
         response = await self.client.post("/api/v1/webhook/sms", json={"message": debit}, headers=headers)
         self.assertEqual(response.json()["status"], "success", response.text)

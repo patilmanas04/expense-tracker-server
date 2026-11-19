@@ -383,7 +383,7 @@ Money in these texts drops a trailing ".00" ("₹649", "₹10,688.10"); names ov
 - **Card bill** (`card_bill`): a credit-card statement or bill reminder, with its total and minimum due.
 - **Expected** (`expected`): an active recurring series (see Recurring payments) whose next payment falls in the range, late ones included at their past date.
 
-Notices are stored in `upcoming_payments` (added by `create_all`; no `user_id`, every row is the owner's like unassigned SMS rows; unique on `notice_key`, `uq_upcoming_notice`). **Storing them waits for real HDFC and ICICI notice samples** (BUILD_ORDER step 21): until then the webhook still ignores notices (see Webhook review), the table stays empty, every read works with no rows, and the list shows the payments expected from your recurring series.
+Notices are stored in `upcoming_payments` (added by `create_all`; no `user_id`, every row is the owner's like unassigned SMS rows; unique on `notice_key`, `uq_upcoming_notice`).
 
 - **Merge:** an expected item is left out when an auto-debit notice, dismissed or not, shares a meaningful word with the series name (`merchants.share_word`: 3+ characters with a letter, case ignored, common words such as "bank", "hdfc", "upi", "autopay" ignored) and is due within 7 days of the expected date. The notice has the real amount and date (a price rise shows at its new price).
 - **Paid** (payments are your parsed INR rows, unassigned SMS included, not a possible duplicate waiting for your decision; hand-added and edited ones count at once, deleted ones stop counting):
@@ -404,7 +404,27 @@ For Safe to spend: `paid_amount` is the sum of the matching card-payment credits
 
 The rules are written and tested against HDFC and ICICI wording only; other banks' notices may not be recognised.
 
-Tests: `tests/test_upcoming.py` (the paid and not-seen rules at their edges, the list, merge, `leaves_bank`, order and statement counts, the API and dismiss, the reminder).
+### Notices (storing, Phase 0)
+
+**How a notice is read** (`notices.py`, pure): an SMS the parser ignores is checked by `notices.parse_notice`. Requests (OTPs, collect and payment requests, pre-approved offers) and failed payments are never notices.
+
+- **Card bill:** the word "card", a card reference ("HDFC XX9012"), a rupee total right after a total label ("total (amount) due", "amount due", "bill of", "bill amount"; the minimum after "min(imum) (amount) due", in either order) and a due date right after the first "due on/by/date" or "pay(ment) by". The payee is "HDFC card XX9012" ("Card XX9012" when no bank is named). "Payment due date IMMEDIATE", a missing or past due date: nothing.
+- **Auto-debit:** "will be debited/deducted/charged", "to be debited" or "is/are scheduled on/for", with a rupee amount (the first one that is not a balance or limit; another currency, 0 or a missing amount gives nothing), a payee after towards/for/to/by/at (skipping dates, amounts and words such as "mandate", "autopay", "your", "the", "upi") and a date: "today", "tomorrow" or the first day-first date (12-12-26, 12/12/2026, 12.12.26, 12-Dec-26, 12 Dec 2026, 12Dec26, 12 Dec, 2026-12-12; three-letter months only; no year means the received year, or the next one when that date is more than 60 days back). A past date gives nothing. "INR 500 will be debited tomorrow" has no payee, so it is not a notice.
+- **One row per bill or debit:** `notice_key` is a SHA-256 of kind | card (card bills) or payee, case and spaces ignored (auto-debits) | due date. A repeat or a reworded reminder (the statement, then "bill is due") stores nothing new, except filling a missing minimum. The row keeps the SMS text in `raw_message` and its received time in `created_at`.
+
+**Not stored yet.** Auto-debit and card-bill notices are recognised but **not stored** until `notices.STORE_NOTICES` is turned on with real samples (BUILD_ORDER step 21, `docs/designs/gated_steps_decision.md`). Until then the table stays empty, every read works with no rows, and the Upcoming list shows expected items from your recurring payments only. The webhook writes one log line per recognised notice to the server's output (INFO, logger `main`), `INFO:     main: Notice recognised, not stored (STORE_NOTICES off): kind=card_bill bank=HDFC`: the kind and bank only, never the text, amount, payee, account or date. That line shows whether the Shortcut forwards notices at all. `STORE_NOTICES` is a code constant: there is no environment variable, setting or button for it.
+
+**Turning storing on (Phase 0, the owner):**
+
+1. Collect one auto-debit / AutoPay pre-debit notice and one card statement or bill-due SMS from each bank (HDFC and ICICI).
+2. Check the server log for the "Notice recognised, not stored" line for each, to confirm the Shortcut forwards them.
+3. Mask them (account and card numbers, mandate IDs, names) and add them to `REAL_NOTICES` in `tests/test_notices.py`, each with the `Notice` it must give (read the comment above it for the received date used).
+4. Amend the rules in `notices.py` until they pass, and the design's Notice rules (`docs/designs/upcoming_payments.md`).
+5. Set `STORE_NOTICES = True` in `notices.py` in the same commit.
+
+`test_store_notices_needs_real_samples` fails the suite when storing is on without a sample of each kind, and `test_real_notices_parse` is skipped ("pending real HDFC/ICICI notice SMS (Phase 0)") until samples exist. Once storing is on, a recognised notice replies `{"status": "ignored", "message": "Saved as an upcoming payment."}`, or "Upcoming payment already saved." for a repeat; any error while reading or storing one is logged ("Could not handle a notice SMS") and the reply is the plain "Message is not a completed transaction.". No transaction is ever saved for a notice. Notices received before that commit are not recovered.
+
+Tests: `tests/test_upcoming.py` (the paid and not-seen rules at their edges, the list, merge, `leaves_bank`, order and statement counts, the API and dismiss, the reminder) and `tests/test_notices.py` (the notice rules on synthetic text, storing, the webhook with storing on and off, the Phase 0 gate).
 
 ## Refund watch
 
@@ -561,7 +581,7 @@ POST /api/v1/jobs/daily?force=true   -> runs every job now, even if it already r
 
 ### Card-bill reminder (`upcoming_reminders`)
 
-`upcoming.daily` reads the upcoming list for today and tomorrow and, for each card bill still `upcoming` (not paid, not dismissed) due today or tomorrow, adds one bell notification: `kind = "card_bill_due"`, "HDFC card XX9012 bill due tomorrow" ("… due today" on the due date) / "₹4,500 due on 5 Dec (minimum ₹500). No payment seen yet." (no "(minimum …)" when the bill gives none), link `/upcoming`, dedupe key `card_bill_due:<notice id>`. The 21:00 run normally sends it the evening before; if that run is missed, the catch-up or the due-date run sends it. **Once per bill**, and never emailed. A failure is logged and rolled back, and the job still counts as run. Until notices are stored (see Upcoming payments) it finds no card bills and creates nothing.
+`upcoming.daily` reads the upcoming list for today and tomorrow and, for each card bill still `upcoming` (not paid, not dismissed) due today or tomorrow, adds one bell notification: `kind = "card_bill_due"`, "HDFC card XX9012 bill due tomorrow" ("… due today" on the due date) / "₹4,500 due on 5 Dec (minimum ₹500). No payment seen yet." (no "(minimum …)" when the bill gives none), link `/upcoming`, dedupe key `card_bill_due:<notice id>`. The 21:00 run normally sends it the evening before; if that run is missed, the catch-up or the due-date run sends it. **Once per bill**, and never emailed. A failure is logged and rolled back, and the job still counts as run. Until notices are stored (`STORE_NOTICES` off, see Upcoming payments) it finds no card bills and creates nothing.
 
 ### Refund reminder (`refund_overdue`)
 
@@ -658,6 +678,7 @@ Round trips to the database (about 277 ms each to TiDB from India):
 | Limit check after a debit | as before, +1 to load merchant limits, +1 more when one matches |
 | `PUT /api/v1/limits/merchants` | about 8: the existing limit, the known check, the memory check, the writes, then the summary |
 | SMS webhook | +1 for your merged name and category rules (one statement); a rule that sets the category also saves the Gemini call |
+| SMS webhook, a recognised notice | 0 while storing is off; 2 when on (the `notice_key` lookup, then the insert or the minimum fill) |
 | `POST /api/v1/transactions` (adding by hand) | +1 for your merged name and category rules (one statement) |
 | After-save checks (background, after the reply) | 4 for the runner (owner, transaction, held-out test, settings), then the limit checks as above, then up to 1 for a payment alert's merchant history |
 | `GET /api/v1/recurring` | 2 after the session: your debits in the window (4 columns), then your decisions |
@@ -726,7 +747,7 @@ Implemented:
 - Fixed truncation of four-plus-digit amounts and added Indian comma grouping for amounts/balances.
 - Atomic duplicate-insert recovery for concurrent retries using the existing unique hash constraint.
 - Removed raw SMS logging; bounded input lengths and timezone validation.
-- Ignored obvious OTP, failed/declined payment, payment-request and offer messages, and notices of money that hasn't moved yet: auto-debit / AutoPay pre-debit alerts ("is scheduled on", "will be debited", "due on/by") and card statements or bill reminders ("total/minimum due", "statement … generated"). A notice that also says the money moved ("debited via UPI AutoPay") is still recorded.
+- Ignored obvious OTP, failed/declined payment, payment-request and offer messages, and notices of money that hasn't moved yet: auto-debit / AutoPay pre-debit alerts ("is scheduled on", "will be debited", "due on/by") and card statements or bill reminders ("total/minimum due", "statement … generated"). A notice that also says the money moved ("debited via UPI AutoPay") is still recorded. Auto-debit and card-bill notices are then read by `notices.py` and, once `STORE_NOTICES` is on, stored as upcoming payments (see Upcoming payments); the reply stays `ignored`.
 - Retained successful regex parsing when merchant is missing, avoiding unnecessary AI requests.
 - Asynchronous Gemini calls with a 20-second timeout, validated fields and safe fallback after parser errors.
 - Excluded unparsed transactions from analytics and omitted raw SMS from the dashboard response.

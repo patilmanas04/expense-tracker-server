@@ -1,8 +1,9 @@
 """Upcoming payments: what is about to leave your accounts, from two sources, all worked out on read.
 
 * **Notices** (`upcoming_payments`): an auto-debit pre-debit notice or a card bill the bank sent. The table is
-  filled from ignored SMS by a later step (notices.py, once real HDFC/ICICI samples are in); until then it is
-  empty and every read works with no rows. No user_id: every row is the owner's, like unassigned SMS rows.
+  filled from ignored SMS by `store_notice` (main.py's webhook) when `notices.STORE_NOTICES` is on. It ships off
+  until real HDFC/ICICI notice samples are in the tests, so the table stays empty and every read works with no
+  rows. No user_id: every row is the owner's, like unassigned SMS rows.
 * **Expected** items: active recurring series (recurring.py) whose next payment falls in the range, late ones
   included with their past date. A series is left out when an auto-debit notice (dismissed or not) shares a word
   with its name (merchants.share_word) and is due within 7 days of its expected date: the notice replaces it.
@@ -36,6 +37,7 @@ from typing import Literal, NamedTuple, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status as http_status
 from pydantic import BaseModel
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import limits
@@ -47,6 +49,7 @@ from database import get_db
 from limits import IST, _short_label, _utc
 from merchants import share_word
 from models import Transaction, UpcomingPayment, User
+from notices import Notice, notice_key
 from notifications import create_once
 from spending import not_held_out
 
@@ -207,6 +210,35 @@ async def list_upcoming(db: AsyncSession, owner: User, today: dt.date, until: dt
             ))
     items.sort(key=_sort_key)
     return items
+
+
+# ---------- Storing notices (webhook) ----------
+
+async def _by_key(db: AsyncSession, key: str) -> Optional[UpcomingPayment]:
+    return await db.scalar(select(UpcomingPayment).where(UpcomingPayment.notice_key == key))
+
+
+async def store_notice(db: AsyncSession, notice: Notice, raw_message: str,
+                       received_at: Optional[dt.datetime]) -> bool:
+    """One row per notice_key. A resent or reworded notice (statement, then "bill is due") stores nothing new; the
+    only update is filling a missing min_amount. True when a row was inserted. 2 statements."""
+    key = notice_key(notice)
+    row = await _by_key(db, key)
+    if row is not None:
+        if row.min_amount is None and notice.min_amount is not None:
+            row.min_amount = notice.min_amount
+            await db.commit()
+        return False
+    db.add(UpcomingPayment(kind=notice.kind, payee=notice.payee, account_ref=notice.account_ref,
+                           amount=notice.amount, min_amount=notice.min_amount, due_date=notice.due_date,
+                           notice_key=key, raw_message=raw_message,
+                           created_at=_utc(received_at or limits.utc_now())))
+    try:
+        await db.commit()
+    except IntegrityError:  # a simultaneous retry stored it first
+        await db.rollback()
+        return False
+    return True
 
 
 # ---------- API ----------

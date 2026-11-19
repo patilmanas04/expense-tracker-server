@@ -28,6 +28,7 @@ import jobs
 import ledger
 import limits
 import low_balance
+import notices
 import payment_alerts
 import post_save
 import recurring
@@ -39,7 +40,7 @@ import transfers
 import upcoming
 import watchdog
 from parser import (UNCATEGORIZED, ParsedTransaction, Recalled, RuleOutcome, compute_message_hash,
-                    detect_category, parse_sms)
+                    detect_bank, detect_category, parse_sms)
 from auth import FRONTEND_URL, current_user, same_origin, router as auth_router
 from balance import CASH_ACCOUNT, BalanceSummary, affects_bank_balance, owner_balance, router as balance_router
 from limits import router as limits_router
@@ -65,6 +66,13 @@ load_dotenv()
 
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 logger = logging.getLogger(__name__)
+# Uvicorn configures only its own loggers, so an INFO line from this module would never reach the server log. The
+# "Notice recognised" line is how the owner checks that the Shortcut forwards notices (README → Upcoming payments).
+if not logger.handlers:
+    _log_handler = logging.StreamHandler()
+    _log_handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s: %(message)s"))
+    logger.addHandler(_log_handler)
+    logger.setLevel(logging.INFO)
 
 
 @asynccontextmanager
@@ -200,6 +208,9 @@ class TransactionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+IGNORED_MESSAGE = "Message is not a completed transaction."
+
+
 class WebhookResponse(BaseModel):
     status: str
     message: str
@@ -227,6 +238,27 @@ async def root():
     }
 
 
+async def _notice_reply(db: AsyncSession, raw_text: str, payload: WebhookPayload) -> str:
+    """The reply for an ignored SMS. A recognised auto-debit or card-bill notice is stored as an upcoming payment
+    while notices.STORE_NOTICES is on; while it is off (until real samples are in the tests) only one log line
+    with the kind and bank is written, never the text, amount, payee, account or date. Never raises."""
+    try:
+        notice = notices.parse_notice(raw_text, payload.sender, payload.received_at)
+        if notice is None:
+            return IGNORED_MESSAGE
+        if not notices.STORE_NOTICES:
+            logger.info("Notice recognised, not stored (STORE_NOTICES off): kind=%s bank=%s",
+                        notice.kind, detect_bank(raw_text, payload.sender) or "unknown")
+            return IGNORED_MESSAGE
+        created = await upcoming.store_notice(db, notice, raw_text, payload.received_at)
+        return "Saved as an upcoming payment." if created else "Upcoming payment already saved."
+    except Exception:
+        logger.exception("Could not handle a notice SMS")
+        with contextlib.suppress(Exception):
+            await db.rollback()
+        return IGNORED_MESSAGE
+
+
 @app.post(
     "/api/v1/webhook/sms",
     response_model=WebhookResponse,
@@ -246,7 +278,9 @@ async def ingest_sms_webhook(
     3. Parses SMS with fast Regex rules, falling back to Gemini AI Agent if uncertain
        (full parse when regex fails, category only when regex cannot categorize). Your merged names
        and category rules (rules.py, one query) come first: the merchant is saved under its merged
-       name, and a matching rule sets the category without a Gemini call.
+       name, and a matching rule sets the category without a Gemini call. An ignored SMS that is an
+       auto-debit or card-bill notice is stored as an upcoming payment (notices.py, upcoming.store_notice)
+       while notices.STORE_NOTICES is on; the reply stays "ignored".
     4. Persists the transaction in TiDB Cloud (PostgreSQL-compatible), and flags a possible duplicate of
        an earlier transaction in the same commit (duplicates.py); a flagged one is held out of totals.
     5. Returns the updated running balance when one is set in Settings.
@@ -298,7 +332,7 @@ async def ingest_sms_webhook(
 
     parsed: ParsedTransaction = await parse_sms(raw_text, payload.sender, recall=recall, apply_rules=apply_rules)
     if parsed.parsed_by == "ignored":
-        return WebhookResponse(status="ignored", message="Message is not a completed transaction.")
+        return WebhookResponse(status="ignored", message=await _notice_reply(db, raw_text, payload))
 
     # Determine transaction timestamp
     tx_time = payload.received_at or parsed.transaction_time or datetime.now(timezone.utc)
